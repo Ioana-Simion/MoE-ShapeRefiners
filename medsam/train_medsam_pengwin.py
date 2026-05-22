@@ -296,6 +296,7 @@ def run_epoch(
     train: bool,
     use_wandb: bool = False,
     global_step: int = 0,
+    log_every: int = 50,
 ) -> tuple[float, int]:
     model.train(train)
     total_loss = 0.0
@@ -335,9 +336,9 @@ def run_epoch(
             global_step += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{total_loss / n_steps:.4f}")
 
-            if use_wandb and train:
+            if use_wandb and train and global_step % log_every == 0:
                 import wandb
-                wandb.log({f"{phase}/step_loss": loss.item()}, step=global_step)
+                wandb.log({"train/step_loss": loss.item(), "train/avg_loss": total_loss / n_steps}, step=global_step)
 
     return total_loss / max(n_steps, 1), global_step
 
@@ -373,6 +374,8 @@ def parse_args() -> argparse.Namespace:
                         default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--use-wandb", action="store_true", default=False)
+    parser.add_argument("--log-every", type=int, default=50,
+                        help="Log train step loss to W&B every N steps.")
     return parser.parse_args()
 
 
@@ -455,7 +458,7 @@ def main() -> int:
         train_loss, global_step = run_epoch(
             model, train_loader, seg_loss, ce_loss, optimizer,
             args.device, args.use_amp, scaler, train=True,
-            use_wandb=args.use_wandb, global_step=global_step,
+            use_wandb=args.use_wandb, global_step=global_step, log_every=args.log_every,
         )
         val_loss, _ = run_epoch(
             model, val_loader, seg_loss, ce_loss, optimizer,
