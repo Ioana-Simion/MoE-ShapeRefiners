@@ -294,14 +294,18 @@ def run_epoch(
     use_amp: bool,
     scaler,
     train: bool,
-) -> float:
+    use_wandb: bool = False,
+    global_step: int = 0,
+) -> tuple[float, int]:
     model.train(train)
     total_loss = 0.0
     n_steps = 0
 
+    phase = "train" if train else "val"
     ctx = torch.enable_grad if train else torch.no_grad
     with ctx():
-        for image, gt2D, boxes, _ in loader:
+        pbar = tqdm(loader, desc=phase, leave=False, dynamic_ncols=True)
+        for image, gt2D, boxes, _ in pbar:
             boxes_np = boxes.detach().cpu().numpy()
             image = image.to(device)
             gt2D = gt2D.to(device)
@@ -328,8 +332,14 @@ def run_epoch(
 
             total_loss += loss.item()
             n_steps += 1
+            global_step += 1
+            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{total_loss / n_steps:.4f}")
 
-    return total_loss / max(n_steps, 1)
+            if use_wandb and train:
+                import wandb
+                wandb.log({f"{phase}/step_loss": loss.item()}, step=global_step)
+
+    return total_loss / max(n_steps, 1), global_step
 
 
 # ---------------------------------------------------------------------------
@@ -439,15 +449,18 @@ def main() -> int:
 
     train_losses, val_losses = [], []
     best_val_loss = 1e10
+    global_step = 0
 
     for epoch in range(start_epoch, args.num_epochs):
-        train_loss = run_epoch(
+        train_loss, global_step = run_epoch(
             model, train_loader, seg_loss, ce_loss, optimizer,
             args.device, args.use_amp, scaler, train=True,
+            use_wandb=args.use_wandb, global_step=global_step,
         )
-        val_loss = run_epoch(
+        val_loss, _ = run_epoch(
             model, val_loader, seg_loss, ce_loss, optimizer,
             args.device, args.use_amp, scaler, train=False,
+            use_wandb=False, global_step=0,
         )
 
         train_losses.append(train_loss)
@@ -458,7 +471,7 @@ def main() -> int:
 
         if args.use_wandb:
             import wandb
-            wandb.log({"train_loss": train_loss, "val_loss": val_loss, "epoch": epoch})
+            wandb.log({"epoch/train_loss": train_loss, "epoch/val_loss": val_loss}, step=global_step)
 
         ckpt = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch}
         torch.save(ckpt, save_dir / "medsam_pengwin_latest.pth")
