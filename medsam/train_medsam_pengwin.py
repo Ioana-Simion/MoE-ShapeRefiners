@@ -51,8 +51,8 @@ SRC_DIR = REPO_ROOT / "src"
 
 DEFAULT_GATED_CSV_DIR = SRC_DIR / "gating_mechanism"
 DEFAULT_BOX_METADATA = REPO_ROOT / "data" / "bounding-boxes-xrays" / "metadata.jsonl"
-DEFAULT_CHECKPOINT = MEDSAM_SRC / "work_dir" / "MedSAM" / "medsam_vit_b.pth"
-DEFAULT_WORK_DIR = REPO_ROOT / "work_dir" / "medsam_pengwin"
+DEFAULT_CHECKPOINT = MEDSAM_SRC / "medsam_vit_b.pth"
+DEFAULT_WORK_DIR = REPO_ROOT / "medsam_pengwin"
 
 if str(MEDSAM_SRC) not in sys.path:
     sys.path.insert(0, str(MEDSAM_SRC))
@@ -252,19 +252,32 @@ class MedSAM(nn.Module):
             param.requires_grad = False
 
     def forward(self, image: torch.Tensor, box: np.ndarray) -> torch.Tensor:
-        image_embedding = self.image_encoder(image)
-        with torch.no_grad():
-            box_torch = torch.as_tensor(box, dtype=torch.float32, device=image.device)
-            if box_torch.ndim == 2:
-                box_torch = box_torch[:, None, :]  # (B, 1, 4)
-            sparse_emb, dense_emb = self.prompt_encoder(points=None, boxes=box_torch, masks=None)
-        low_res_masks, _ = self.mask_decoder(
-            image_embeddings=image_embedding,
-            image_pe=self.prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_emb,
-            dense_prompt_embeddings=dense_emb,
-            multimask_output=False,
-        )
+        # Run image encoder on the full batch (the expensive op).
+        image_embedding = self.image_encoder(image)  # (B, 256, 64, 64)
+
+        # The standard SAM mask decoder repeats the image embedding by the number
+        # of prompts, so it only handles (1 image, N boxes) — not (B images, B boxes).
+        # Process prompt encoder + mask decoder one sample at a time to stay compatible.
+        box_torch = torch.as_tensor(box, dtype=torch.float32, device=image.device)
+        if box_torch.ndim == 2:
+            box_torch = box_torch[:, None, :]  # (B, 1, 4)
+
+        masks_list = []
+        for i in range(image.shape[0]):
+            with torch.no_grad():
+                sparse_emb, dense_emb = self.prompt_encoder(
+                    points=None, boxes=box_torch[i : i + 1], masks=None
+                )
+            low_res_mask, _ = self.mask_decoder(
+                image_embeddings=image_embedding[i : i + 1],
+                image_pe=self.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_emb,
+                dense_prompt_embeddings=dense_emb,
+                multimask_output=False,
+            )
+            masks_list.append(low_res_mask)
+
+        low_res_masks = torch.cat(masks_list, dim=0)  # (B, 1, 256, 256)
         return F.interpolate(low_res_masks, size=image.shape[2:], mode="bilinear", align_corners=False)
 
 
@@ -414,7 +427,7 @@ def main() -> int:
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
     seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
     ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
-    scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
+    scaler = torch.amp.GradScaler("cuda") if args.use_amp else None
 
     start_epoch = 0
     if args.resume and os.path.isfile(args.resume):
