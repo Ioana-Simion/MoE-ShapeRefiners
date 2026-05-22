@@ -36,3 +36,6 @@ checkpoints/
 wandb/
 work_dir/
 *.pth
+/jobs
+/job_logs
+/medsam_pengwin

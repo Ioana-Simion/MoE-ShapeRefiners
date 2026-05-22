@@ -38,12 +38,12 @@ from tqdm import tqdm
 WORKSPACE_ROOT = Path(
     os.environ.get("SLURM_SUBMIT_DIR", str(Path(__file__).resolve().parents[2]))
 )
-PENGWIN_ROOT = WORKSPACE_ROOT / "data" / "pengwin"
+PENGWIN_ROOT = Path("/home/isimion/datasets/pengwin")
 XRAY_IMAGE_ROOT = (
-    PENGWIN_ROOT / "original" / "task2_xray" / "train" / "input" / "images" / "x-ray"
+    PENGWIN_ROOT / "train" / "input" / "images" / "x-ray"
 )
 XRAY_LABEL_ROOT = (
-    PENGWIN_ROOT / "original" / "task2_xray" / "train" / "output" / "images" / "x-ray"
+    PENGWIN_ROOT / "train" / "output" / "images" / "x-ray"
 )
 DEFAULT_OUTPUT_ROOT = (
     Path(__file__).resolve().parents[1] / "data" / "bounding-boxes-xrays"
