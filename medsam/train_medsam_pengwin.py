@@ -177,7 +177,7 @@ class PengwinGatedDataset(Dataset):
 
         return (
             torch.tensor(image.transpose(2, 0, 1)).float(),   # (3, 1024, 1024)
-            torch.tensor(gt_resized[None, :, :]).long(),       # (1, 1024, 1024)
+            torch.tensor(gt_resized[None, :, :]).float(),      # (1, 1024, 1024)
             torch.tensor(bbox).float(),                        # (4,)
             f"{sample_name}_frag{target_id}",
         )
@@ -187,7 +187,7 @@ def stratified_subsample(df: pd.DataFrame, n: int, seed: int = 42) -> list[dict]
     """Subsample n records preserving the SA/LI/RI class distribution."""
     return (
         df.groupby("category_name", group_keys=False)
-        .apply(lambda x: x.sample(frac=n / len(df), random_state=seed))
+        .apply(lambda x: x.sample(frac=n / len(df), random_state=seed), include_groups=False)
         .reset_index(drop=True)
         .to_dict("records")
     )
