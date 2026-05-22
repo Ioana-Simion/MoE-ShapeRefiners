@@ -34,3 +34,5 @@ data/medsam-predictions/evaluation_pengwin*.csv
 
 checkpoints/
 wandb/
+work_dir/
+*.pth
