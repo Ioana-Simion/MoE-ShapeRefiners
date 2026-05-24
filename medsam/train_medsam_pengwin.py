@@ -282,6 +282,7 @@ def run_epoch(
     global_step: int = 0,
     log_every: int = 50,
     ddp: bool = False,
+    show_progress: bool = True,
 ) -> tuple[float, int]:
     model.train(train)
     total_loss = 0.0
@@ -290,7 +291,7 @@ def run_epoch(
     phase = "train" if train else "val"
     ctx = torch.enable_grad if train else torch.no_grad
     with ctx():
-        pbar = tqdm(loader, desc=phase, leave=False, dynamic_ncols=True)
+        pbar = tqdm(loader, desc=phase, leave=False, dynamic_ncols=True, disable=not show_progress)
         for image, gt2D, boxes, _ in pbar:
             boxes_np = boxes.detach().cpu().numpy()
             image = image.to(device)
@@ -391,6 +392,14 @@ def main() -> int:
     is_main = rank == 0
     device = torch.device(f"cuda:{local_rank}")
 
+    # Always print rank info so we can verify DDP is set up correctly.
+    print(f"[rank {rank}/{world_size}] local_rank={local_rank} device={device}", flush=True)
+
+    # Disable wandb on all non-main ranks — belt-and-suspenders in case anything
+    # accidentally calls wandb.log or wandb.init on a worker process.
+    if not is_main:
+        os.environ["WANDB_DISABLED"] = "true"
+
     if is_main:
         if not args.checkpoint.exists():
             print(
@@ -488,7 +497,13 @@ def main() -> int:
     if is_main:
         total_p = sum(p.numel() for p in model.parameters())
         train_p = sum(p.numel() for p in trainable)
+        steps_per_epoch = len(train_loader)
         print(f"Total params: {total_p:,}  |  Trainable: {train_p:,}  |  World size: {world_size}")
+        print(f"Steps/epoch: {steps_per_epoch}  (expect ~{len(train_dataset) // (args.batch_size * world_size)} with DDP)")
+        if args.use_wandb:
+            import wandb
+            wandb.summary["steps_per_epoch"] = steps_per_epoch
+            wandb.summary["world_size"] = world_size
 
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
     seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
@@ -524,6 +539,7 @@ def main() -> int:
             global_step=global_step,
             log_every=args.log_every,
             ddp=ddp,
+            show_progress=is_main,
         )
 
         if is_main:
@@ -531,6 +547,7 @@ def main() -> int:
                 model, val_loader, seg_loss, ce_loss, optimizer,
                 device, args.use_amp, scaler, train=False,
                 ddp=False,
+                show_progress=True,
             )
 
             train_losses.append(train_loss)
