@@ -453,23 +453,22 @@ def main() -> int:
         pin_memory=True,
     )
 
-    # Val runs on rank 0 only — no need to distribute evaluation.
-    if is_main:
-        val_dataset = build_medsam_dataset(
-            args.gated_csv_dir, box_meta, "val",
-            large_subsample=None,
-            bbox_shift=0,
-            is_main=True,
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
-    else:
-        val_loader = None
+    # Val runs on all ranks to stay in sync; only rank 0 reports the result.
+    val_dataset = build_medsam_dataset(
+        args.gated_csv_dir, box_meta, "val",
+        large_subsample=None,
+        bbox_shift=0,
+        is_main=is_main,
+    )
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False) if ddp else None
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
 
     # ---- Model ------------------------------------------------------------
     if is_main:
@@ -542,14 +541,15 @@ def main() -> int:
             show_progress=is_main,
         )
 
-        if is_main:
-            val_loss, _ = run_epoch(
-                model, val_loader, seg_loss, ce_loss, optimizer,
-                device, args.use_amp, scaler, train=False,
-                ddp=False,
-                show_progress=True,
-            )
+        # All ranks run val to stay in sync; loss is averaged across ranks.
+        val_loss, _ = run_epoch(
+            model, val_loader, seg_loss, ce_loss, optimizer,
+            device, args.use_amp, scaler, train=False,
+            ddp=ddp,
+            show_progress=is_main,
+        )
 
+        if is_main:
             train_losses.append(train_loss)
             val_losses.append(val_loss)
 
