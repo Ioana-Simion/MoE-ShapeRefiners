@@ -30,7 +30,7 @@ import os
 import random
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -382,7 +382,7 @@ def main() -> int:
     if ddp:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
         rank = dist.get_rank()
         world_size = dist.get_world_size()
     else:
