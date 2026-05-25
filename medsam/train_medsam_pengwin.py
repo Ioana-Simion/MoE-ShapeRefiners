@@ -326,6 +326,7 @@ def run_epoch(
                 import wandb
                 wandb.log({"train/step_loss": loss.item(), "train/avg_loss": total_loss / n_steps}, step=global_step)
 
+
     avg_loss = total_loss / max(n_steps, 1)
 
     # Average loss across all ranks so the logged value is meaningful.
@@ -539,13 +540,14 @@ def main() -> int:
             log_every=args.log_every,
             ddp=ddp,
             show_progress=is_main,
+
         )
 
-        # All ranks run val to stay in sync; loss is averaged across ranks.
+        # All ranks run val to stay in sync; no all_reduce — rank 0 reports its local loss.
         val_loss, _ = run_epoch(
             model, val_loader, seg_loss, ce_loss, optimizer,
             device, args.use_amp, scaler, train=False,
-            ddp=ddp,
+            ddp=False,
             show_progress=is_main,
         )
 
