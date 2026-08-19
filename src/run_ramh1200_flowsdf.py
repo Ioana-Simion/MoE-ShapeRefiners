@@ -74,13 +74,27 @@ for _p in (
         sys.path.insert(0, str(_p))
 
 from prepare_ramh1200_boxes import process_split  # noqa: E402
-from run_medsam_with_pengwin_boxes import (  # noqa: E402
-    load_and_preprocess_image,
-    run_medsam_with_boxes,
-)
+try:
+    from run_medsam_with_pengwin_boxes import (  # noqa: E402
+        load_and_preprocess_image,
+        run_medsam_with_boxes,
+    )
+    from segment_anything import sam_model_registry  # noqa: E402
+except ModuleNotFoundError as exc:
+    if exc.name == "segment_anything":
+        raise ModuleNotFoundError(
+            "segment_anything not importable. This is almost always a missing "
+            "pip package, not a src/ layout problem -- run_medsam_with_pengwin_boxes.py "
+            f"also expects a sibling 'MedSAM' checkout at {MEDSAM_REPO_ROOT} for its "
+            "own default checkpoint path, but the segment_anything *package* itself "
+            "should come from pip. Fix: `pip install segment-anything` in the active "
+            "env (it's already in this repo's environment.yml). If the checkpoint "
+            "file isn't at the assumed sibling-MedSAM location, pass "
+            "--medsam-checkpoint /actual/path/to/medsam_vit_b.pth explicitly."
+        ) from exc
+    raise
 from dataloader_utils import load_prediction_masks, resize_binary_nearest  # noqa: E402
 from models import unet_segdiff  # noqa: E402
-from segment_anything import sam_model_registry  # noqa: E402
 from evaluation.evaluate_medsam_pengwin import (  # noqa: E402
     dice_score,
     iou_score,
@@ -108,8 +122,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=Path, default=REPO_ROOT / "RAM-H1200-v1_dataset" / "Segmentation")
     parser.add_argument("--boxes-root", type=Path, default=REPO_ROOT / "data" / "ramh1200" / "bounding-boxes")
     parser.add_argument("--medsam-pred-root", type=Path, default=REPO_ROOT / "data" / "ramh1200" / "medsam-predictions")
-    parser.add_argument("--flowsdf-pred-root", type=Path, default=REPO_ROOT / "data" / "ramh1200" / "flowsdf-predictions")
-    parser.add_argument("--figures-root", type=Path, default=REPO_ROOT / "figures" / "ramh1200_flowsdf")
+    parser.add_argument(
+        "--flowsdf-pred-root", type=Path, default=None,
+        help=(
+            "Where FlowSDF masks/eval CSVs are written. Defaults to "
+            "data/ramh1200/flowsdf-predictions/ode<N> where <N> is --ode-steps -- "
+            "runs at different step counts land in separate directories automatically, "
+            "so a second run doesn't silently reuse or overwrite a different step "
+            "count's masks via --skip-existing. Pass this explicitly to override."
+        ),
+    )
+    parser.add_argument(
+        "--figures-root", type=Path, default=None,
+        help="Where visualization panels are written. Defaults to figures/ramh1200_flowsdf/ode<N>, same reasoning as --flowsdf-pred-root.",
+    )
     parser.add_argument("--medsam-checkpoint", type=Path, default=MEDSAM_REPO_ROOT / "medsam_vit_b.pth")
     parser.add_argument("--flowsdf-checkpoint-dir", type=Path, default=REPO_ROOT / "checkpoints" / "FlowSDF")
     parser.add_argument("--ode-steps", type=int, default=40, help="Euler ODE steps. 40 matches the job that produced this repo's reported PENGWIN numbers; the infer_flowsdf_moe.py default of 4 is not representative.")
@@ -498,9 +524,9 @@ def run_pengwin_reroute_shard(
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
-def evaluate_predictions(medsam_pred_records: list[dict], pred_masks_dir: Path, gated_df: pd.DataFrame) -> pd.DataFrame:
+def evaluate_predictions(medsam_pred_records: list[dict], pred_masks_dir: Path, gated_df: pd.DataFrame, desc: str = "evaluating") -> pd.DataFrame:
     rows = []
-    for record in medsam_pred_records:
+    for record in tqdm(medsam_pred_records, desc=desc):
         sample_name = record["sample_name"]
         gt_masks = np.load(record["gt_masks_path"])["masks"]
         pred_masks = load_prediction_masks(pred_masks_dir / f"{sample_name}.npz")
@@ -639,8 +665,15 @@ def main() -> int:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    if args.flowsdf_pred_root is None:
+        args.flowsdf_pred_root = REPO_ROOT / "data" / "ramh1200" / "flowsdf-predictions" / f"ode{args.ode_steps}"
+    if args.figures_root is None:
+        args.figures_root = REPO_ROOT / "figures" / "ramh1200_flowsdf" / f"ode{args.ode_steps}"
+
     devices = pick_devices(args.num_gpus)
     print(f"devices: {devices}")
+    print(f"flowsdf-pred-root: {args.flowsdf_pred_root}")
+    print(f"figures-root: {args.figures_root}")
 
     t0 = time.time()
 
@@ -751,8 +784,8 @@ def main() -> int:
 
     # --- Step 5: evaluation ----------------------------------------------------
     print("\n=== Step 5: evaluation ===")
-    baseline_df = evaluate_predictions(medsam_pred_records, args.medsam_pred_root / args.split / "binary_masks", gated_df)
-    flowsdf_df = evaluate_predictions(medsam_pred_records, flowsdf_masks_dir, gated_df)
+    baseline_df = evaluate_predictions(medsam_pred_records, args.medsam_pred_root / args.split / "binary_masks", gated_df, desc="eval: MedSAM baseline")
+    flowsdf_df = evaluate_predictions(medsam_pred_records, flowsdf_masks_dir, gated_df, desc="eval: FlowSDF (RAM-H1200-relative)")
 
     eval_dir = args.flowsdf_pred_root / args.split
     baseline_df.to_csv(eval_dir / "evaluation_medsam_baseline.csv", index=False)
@@ -768,7 +801,7 @@ def main() -> int:
     print(flowsdf_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
 
     if args.pengwin_reroute:
-        pengwin_df = evaluate_predictions(medsam_pred_records, pengwin_masks_dir, gated_df_pengwin)
+        pengwin_df = evaluate_predictions(medsam_pred_records, pengwin_masks_dir, gated_df_pengwin, desc="eval: FlowSDF (PENGWIN-absolute)")
         pengwin_df.to_csv(eval_dir / "evaluation_flowsdf_pengwin_convention.csv", index=False)
 
         print("\nMedSAM + frozen FlowSDF, PENGWIN-absolute routing (overall):")
@@ -787,7 +820,7 @@ def main() -> int:
         )
         print(f"\nIsolating the {len(flipped_keys)} flipped fragments:")
         flipped_rows = []
-        for sample_name in {k[0] for k in flipped_keys}:
+        for sample_name in tqdm({k[0] for k in flipped_keys}, desc="eval: flipped fragments"):
             record = next(r for r in medsam_pred_records if r["sample_name"] == sample_name)
             gt_masks = np.load(record["gt_masks_path"])["masks"]
             baseline_masks = load_prediction_masks(args.medsam_pred_root / args.split / "binary_masks" / f"{sample_name}.npz")
