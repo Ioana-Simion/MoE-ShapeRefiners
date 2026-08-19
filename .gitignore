@@ -37,3 +37,7 @@ data/medsam-predictions/evaluation_pengwin*.csv
 
 checkpoints/
 wandb/
+
+RAM-H1200-v1_dataset/
+checkpoints/
+figures/
