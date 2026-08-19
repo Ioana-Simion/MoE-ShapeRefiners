@@ -23,15 +23,25 @@ Pipeline:
        (GT / MedSAM baseline / FlowSDF refined) saved as its own PNG -- no
        merged figure -- named so the scan and the panel are both identifiable.
 
-Single GPU:
+Single GPU (recommended starting point -- see note below):
     python src/run_ramh1200_flowsdf.py --split test --num-gpus 1
-
-Two GPUs (shards images across them, no distributed training machinery --
-this is inference, so sharding + a join is enough):
-    python src/run_ramh1200_flowsdf.py --split test --num-gpus 2
 
 Smoke test first:
     python src/run_ramh1200_flowsdf.py --split test --num-gpus 1 --limit 15
+
+Two GPUs, one SLURM task that owns both directly (this script spawns its own
+worker subprocesses internally via multiprocessing + join(), all within one
+process -- no cross-process synchronization needed):
+    python src/run_ramh1200_flowsdf.py --split test --num-gpus 2
+
+Deliberately NOT supported here: launching via `srun --ntasks=N` with one
+independent process per GPU (RANK/WORLD_SIZE in the environment). That would
+need cross-process barriers for the two points that need a global view --
+computing the gating threshold after Stage-1 MedSAM, and evaluation/
+visualization after FlowSDF -- which adds real coordination risk for a
+workload where batching (--batch-size) already gives most of the win.
+Single-GPU-with-batching first; revisit multi-GPU only if that's still too
+slow once measured for real.
 """
 from __future__ import annotations
 
@@ -82,6 +92,12 @@ SIGMA_MIN = 1e-5
 SDF_BINARY_THRESHOLD = 0.03
 OUTPUT_SIZE = 1024
 
+# PENGWIN's own small/large split point -- the threshold the frozen experts
+# were actually trained with, which is their own 25th percentile fragment
+# area (data_distribution_results/data_analysis_gt_with_medsam/threshold_suggestions.csv).
+# RAM-H1200's own median fragment area is well below this. See --pengwin-reroute.
+PENGWIN_SMALL_THRESHOLD = 5402.0
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -99,11 +115,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ode-steps", type=int, default=40, help="Euler ODE steps. 40 matches the job that produced this repo's reported PENGWIN numbers; the infer_flowsdf_moe.py default of 4 is not representative.")
     parser.add_argument("--n-eval", type=int, default=1, help="Number of stochastic ODE trajectories to average per fragment.")
     parser.add_argument("--batch-size", type=int, default=16, help="Fragments per batched FlowSDF forward pass (same expert).")
-    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs to shard images across. 1 = single process, no multiprocessing overhead.")
+    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs to shard images across via this script's own internal multiprocessing (one process, join()-based -- no cross-process sync needed). 1 = plain single-process run.")
     parser.add_argument("--limit", type=int, default=None, help="Process only the first N images (smoke test).")
     parser.add_argument("--n-viz-each", type=int, default=3, help="How many worst/median/best cases to save panels for.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skip-existing", action="store_true", help="Skip MedSAM/FlowSDF outputs that already exist on disk.")
+    parser.add_argument(
+        "--pengwin-reroute", action="store_true",
+        help=(
+            "Additionally re-route fragments using PENGWIN's own absolute area threshold "
+            f"({PENGWIN_SMALL_THRESHOLD:.0f}px) instead of this dataset's relative median, "
+            "and re-run FlowSDF only on the fragments whose expert assignment changes "
+            "(large -> small, since PENGWIN's threshold sits above RAM-H1200's own median). "
+            "Reuses the primary run's masks for everything unchanged. See notebook Section 11."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -364,6 +390,112 @@ def _flowsdf_worker(rank: int, device: str, sample_names: list[str], gated_df: p
 
 
 # ---------------------------------------------------------------------------
+# Stage 3b: PENGWIN-absolute reroute (only recompute flipped fragments)
+# ---------------------------------------------------------------------------
+def reroute_pengwin_convention(gated_df: pd.DataFrame) -> pd.DataFrame:
+    """Reassign expert using PENGWIN's absolute area threshold instead of this
+    dataset's own relative median. See notebook Section 11: PENGWIN's 5402px
+    threshold is their own 25th percentile fragment area, and RAM-H1200
+    fragments sit much lower on that absolute scale."""
+    rerouted = gated_df.copy()
+    rerouted["expert"] = np.where(rerouted["area"] <= PENGWIN_SMALL_THRESHOLD, "expert_small", "expert_large")
+    return rerouted
+
+
+def run_pengwin_reroute_shard(
+    sample_names: list[str],
+    gated_df: pd.DataFrame,
+    gated_df_pengwin: pd.DataFrame,
+    device: str,
+    checkpoint_dir: Path,
+    ode_steps: int,
+    n_eval: int,
+    batch_size: int,
+    source_masks_dir: Path,
+    dest_masks_dir: Path,
+    skip_existing: bool,
+) -> None:
+    """Seed every sample's output from the primary run's already-computed
+    masks, then only recompute the fragments whose expert assignment changes
+    under PENGWIN-absolute routing. Direction-agnostic (doesn't assume flips
+    only go large->small), though in practice that's the only direction seen
+    here since PENGWIN_SMALL_THRESHOLD sits above RAM-H1200's own median."""
+    pending_sample_names = sample_names
+    if skip_existing:
+        pending_sample_names = [s for s in sample_names if not (dest_masks_dir / f"{s}.npz").exists()]
+    if not pending_sample_names:
+        return
+
+    orig_by_key = {
+        (r["sample_name"], int(r["medsam_instance_id"])): r["expert"]
+        for r in gated_df[gated_df["sample_name"].isin(pending_sample_names)].to_dict("records")
+    }
+    new_rows = gated_df_pengwin[gated_df_pengwin["sample_name"].isin(pending_sample_names)].to_dict("records")
+    flipped_tasks = [
+        r for r in new_rows
+        if orig_by_key.get((r["sample_name"], int(r["medsam_instance_id"]))) != r["expert"]
+    ]
+    print(f"[{device}] {len(flipped_tasks)} / {len(new_rows)} fragments flip expert under PENGWIN-absolute routing")
+
+    out_arrays: dict[str, np.ndarray] = {
+        s: load_prediction_masks(source_masks_dir / f"{s}.npz").copy() for s in pending_sample_names
+    }
+
+    if flipped_tasks:
+        experts: dict[str, torch.nn.Module] = {}
+        tasks_by_expert: dict[str, list[dict]] = {}
+        for t in flipped_tasks:
+            tasks_by_expert.setdefault(t["expert"], []).append(t)
+
+        embedding_cache: dict[str, torch.Tensor] = {}
+        medsam_masks_cache: dict[str, np.ndarray] = {}
+
+        def get_embedding(path: str) -> torch.Tensor:
+            if path not in embedding_cache:
+                embedding_cache[path] = torch.from_numpy(np.load(path)).float()
+            return embedding_cache[path]
+
+        def get_medsam_masks(path: str) -> np.ndarray:
+            if path not in medsam_masks_cache:
+                medsam_masks_cache[path] = load_prediction_masks(path)
+            return medsam_masks_cache[path]
+
+        for expert_id, expert_tasks in tasks_by_expert.items():
+            if expert_id not in experts:
+                ckpt_path = checkpoint_dir / f"{expert_id}_best.pth"
+                if not ckpt_path.exists():
+                    raise FileNotFoundError(f"missing checkpoint: {ckpt_path}")
+                experts[expert_id] = load_flowsdf_expert(ckpt_path, device)
+            model = experts[expert_id]
+
+            for batch_start in tqdm(range(0, len(expert_tasks), batch_size), desc=f"[{device}] PENGWIN-reroute {expert_id}"):
+                batch_tasks = expert_tasks[batch_start:batch_start + batch_size]
+
+                cond_list = []
+                for t in batch_tasks:
+                    embedding = get_embedding(t["embedding_path"])
+                    masks = get_medsam_masks(t["binary_masks_path"])
+                    idx = int(t["medsam_instance_id"]) - 1
+                    cond_list.append(prepare_flowsdf_conditioning(embedding, masks[idx], FLOWSDF_IMG_SIZE, device))
+
+                img_cond = torch.cat(cond_list, dim=0)
+                sdf = sample_flowsdf_sdf_batched(model, img_cond, SIGMA_MIN, ode_steps, n_eval)
+                mask_small = (sdf <= SDF_BINARY_THRESHOLD).float()
+                mask_up = F.interpolate(mask_small, size=(OUTPUT_SIZE, OUTPUT_SIZE), mode="nearest")
+                mask_up = mask_up[:, 0].cpu().numpy().astype(np.uint8)
+
+                for t, refined in zip(batch_tasks, mask_up):
+                    idx = int(t["medsam_instance_id"]) - 1
+                    out_arrays[t["sample_name"]][idx] = refined
+
+    for sample_name, arr in out_arrays.items():
+        np.savez_compressed(dest_masks_dir / f"{sample_name}.npz", masks=arr)
+
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 def evaluate_predictions(medsam_pred_records: list[dict], pred_masks_dir: Path, gated_df: pd.DataFrame) -> pd.DataFrame:
@@ -598,6 +730,25 @@ def main() -> int:
             if p.exitcode != 0:
                 raise RuntimeError(f"FlowSDF worker failed with exit code {p.exitcode}")
 
+    # --- Step 4b: PENGWIN-absolute reroute (optional) --------------------------
+    gated_df_pengwin = None
+    pengwin_masks_dir = None
+    if args.pengwin_reroute:
+        print(f"\n=== Step 4b: PENGWIN-absolute reroute (threshold={PENGWIN_SMALL_THRESHOLD:.0f}px) ===")
+        gated_df_pengwin = reroute_pengwin_convention(gated_df)
+        pengwin_csv_path = gating_dir / f"gated_ramh1200_flowsdf_pengwin_{args.split}_records.csv"
+        gated_df_pengwin.to_csv(pengwin_csv_path, index=False)
+        changed = int((gated_df_pengwin["expert"] != gated_df["expert"]).sum())
+        print(f"{changed} / {len(gated_df)} fragments change expert assignment ({changed / len(gated_df):.1%})")
+        print(gated_df_pengwin["expert"].value_counts().to_string())
+
+        pengwin_masks_dir = args.flowsdf_pred_root / args.split / "binary_masks_pengwin_convention"
+        pengwin_masks_dir.mkdir(parents=True, exist_ok=True)
+        run_pengwin_reroute_shard(
+            sample_names, gated_df, gated_df_pengwin, devices[0], args.flowsdf_checkpoint_dir,
+            args.ode_steps, args.n_eval, args.batch_size, flowsdf_masks_dir, pengwin_masks_dir, args.skip_existing,
+        )
+
     # --- Step 5: evaluation ----------------------------------------------------
     print("\n=== Step 5: evaluation ===")
     baseline_df = evaluate_predictions(medsam_pred_records, args.medsam_pred_root / args.split / "binary_masks", gated_df)
@@ -615,6 +766,49 @@ def main() -> int:
     print(baseline_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
     print("\nMedSAM + frozen FlowSDF by size group:")
     print(flowsdf_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
+
+    if args.pengwin_reroute:
+        pengwin_df = evaluate_predictions(medsam_pred_records, pengwin_masks_dir, gated_df_pengwin)
+        pengwin_df.to_csv(eval_dir / "evaluation_flowsdf_pengwin_convention.csv", index=False)
+
+        print("\nMedSAM + frozen FlowSDF, PENGWIN-absolute routing (overall):")
+        print(pengwin_df[["dice", "iou", "hd95", "assd"]].mean())
+        print("\nMedSAM + frozen FlowSDF, PENGWIN-absolute routing, by (new) size group:")
+        print(pengwin_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
+
+        # Isolate the effect: for exactly the fragments that flip expert, compare
+        # baseline vs. old (RAM-H1200-relative) refined vs. new (PENGWIN-absolute)
+        # refined, fragment by fragment -- holds the fragment set fixed and only
+        # changes which expert refined it.
+        flipped_keys = set(
+            map(tuple, gated_df_pengwin.loc[
+                gated_df_pengwin["expert"] != gated_df["expert"], ["sample_name", "medsam_instance_id"]
+            ].values)
+        )
+        print(f"\nIsolating the {len(flipped_keys)} flipped fragments:")
+        flipped_rows = []
+        for sample_name in {k[0] for k in flipped_keys}:
+            record = next(r for r in medsam_pred_records if r["sample_name"] == sample_name)
+            gt_masks = np.load(record["gt_masks_path"])["masks"]
+            baseline_masks = load_prediction_masks(args.medsam_pred_root / args.split / "binary_masks" / f"{sample_name}.npz")
+            old_masks = load_prediction_masks(flowsdf_masks_dir / f"{sample_name}.npz")
+            new_masks = load_prediction_masks(pengwin_masks_dir / f"{sample_name}.npz")
+
+            for frag in record["fragments"]:
+                key = (sample_name, frag["medsam_instance_id"])
+                if key not in flipped_keys:
+                    continue
+                idx = frag["medsam_instance_id"] - 1
+                gt = gt_masks[idx]
+                flipped_rows.append({
+                    "sample_name": sample_name,
+                    "baseline_dice": dice_score(resize_binary_nearest(baseline_masks[idx], gt.shape), gt),
+                    "expert_large_dice": dice_score(resize_binary_nearest(old_masks[idx], gt.shape), gt),
+                    "expert_small_dice": dice_score(resize_binary_nearest(new_masks[idx], gt.shape), gt),
+                })
+        flipped_df = pd.DataFrame(flipped_rows)
+        flipped_df.to_csv(eval_dir / "evaluation_flipped_fragments.csv", index=False)
+        print(flipped_df[["baseline_dice", "expert_large_dice", "expert_small_dice"]].mean())
 
     # --- Step 6: visualizations (separate panels, not merged) ------------------
     print("\n=== Step 6: visualizations ===")
