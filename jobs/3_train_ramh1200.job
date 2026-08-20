@@ -58,8 +58,9 @@ fi
 if [ "$EXPERT_TYPE" = "flowsdf" ]; then
     python src/FlowSDF/train_flowsdf_ramh1200.py \
         --expert both \
-        --epochs 100 \
+        --epochs 40 \
         --batch-size 8 \
+        --num-workers 8 \
         --checkpoint-dir checkpoints/flowsdf_ramh1200 \
         --wandb-project moe-shaprefine \
         "${LARGE_SUBSAMPLE_ARGS[@]}"
@@ -68,6 +69,7 @@ else
         --expert both \
         --epochs 20 \
         --batch-size 64 \
+        --num-workers 8 \
         --checkpoint-dir checkpoints/cnnNoROI_ramh1200 \
         --wandb-project moe-shaprefine \
         "${LARGE_SUBSAMPLE_ARGS[@]}"
