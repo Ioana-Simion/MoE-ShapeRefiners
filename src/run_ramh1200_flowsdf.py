@@ -156,6 +156,16 @@ def parse_args() -> argparse.Namespace:
             "Reuses the primary run's masks for everything unchanged. See notebook Section 11."
         ),
     )
+    parser.add_argument(
+        "--small-expert-only", action="store_true",
+        help=(
+            "Additionally force EVERY fragment through expert_small, regardless of area, "
+            "and evaluate against the original (RAM-H1200-relative) size groups -- how well "
+            "does the one expert that's reliably transferred zero-shot do on the fragments "
+            "currently routed to expert_large, including the genuinely-large ones? Only "
+            "recomputes fragments not already assigned expert_small in the primary run."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -416,7 +426,9 @@ def _flowsdf_worker(rank: int, device: str, sample_names: list[str], gated_df: p
 
 
 # ---------------------------------------------------------------------------
-# Stage 3b: PENGWIN-absolute reroute (only recompute flipped fragments)
+# Stage 3b: re-route to an alternate expert assignment (only recompute
+# fragments whose assignment actually changes). Used for both the
+# PENGWIN-absolute reroute and the "expert_small on everything" experiment.
 # ---------------------------------------------------------------------------
 def reroute_pengwin_convention(gated_df: pd.DataFrame) -> pd.DataFrame:
     """Reassign expert using PENGWIN's absolute area threshold instead of this
@@ -428,10 +440,10 @@ def reroute_pengwin_convention(gated_df: pd.DataFrame) -> pd.DataFrame:
     return rerouted
 
 
-def run_pengwin_reroute_shard(
+def run_reroute_shard(
     sample_names: list[str],
     gated_df: pd.DataFrame,
-    gated_df_pengwin: pd.DataFrame,
+    gated_df_target: pd.DataFrame,
     device: str,
     checkpoint_dir: Path,
     ode_steps: int,
@@ -440,12 +452,11 @@ def run_pengwin_reroute_shard(
     source_masks_dir: Path,
     dest_masks_dir: Path,
     skip_existing: bool,
+    label: str = "reroute",
 ) -> None:
     """Seed every sample's output from the primary run's already-computed
     masks, then only recompute the fragments whose expert assignment changes
-    under PENGWIN-absolute routing. Direction-agnostic (doesn't assume flips
-    only go large->small), though in practice that's the only direction seen
-    here since PENGWIN_SMALL_THRESHOLD sits above RAM-H1200's own median."""
+    between gated_df (original) and gated_df_target (desired). Direction-agnostic."""
     pending_sample_names = sample_names
     if skip_existing:
         pending_sample_names = [s for s in sample_names if not (dest_masks_dir / f"{s}.npz").exists()]
@@ -456,12 +467,12 @@ def run_pengwin_reroute_shard(
         (r["sample_name"], int(r["medsam_instance_id"])): r["expert"]
         for r in gated_df[gated_df["sample_name"].isin(pending_sample_names)].to_dict("records")
     }
-    new_rows = gated_df_pengwin[gated_df_pengwin["sample_name"].isin(pending_sample_names)].to_dict("records")
+    new_rows = gated_df_target[gated_df_target["sample_name"].isin(pending_sample_names)].to_dict("records")
     flipped_tasks = [
         r for r in new_rows
         if orig_by_key.get((r["sample_name"], int(r["medsam_instance_id"]))) != r["expert"]
     ]
-    print(f"[{device}] {len(flipped_tasks)} / {len(new_rows)} fragments flip expert under PENGWIN-absolute routing")
+    print(f"[{device}] {label}: {len(flipped_tasks)} / {len(new_rows)} fragments change expert assignment")
 
     out_arrays: dict[str, np.ndarray] = {
         s: load_prediction_masks(source_masks_dir / f"{s}.npz").copy() for s in pending_sample_names
@@ -590,7 +601,7 @@ def save_visualizations(
     records_by_name = {r["sample_name"]: r for r in medsam_pred_records}
 
     delta_rows = []
-    for record in medsam_pred_records:
+    for record in tqdm(medsam_pred_records, desc="ranking images for worst/median/best"):
         sample_name = record["sample_name"]
         gt_masks = np.load(record["gt_masks_path"])["masks"]
         baseline_masks = load_prediction_masks(medsam_pred_root / split / "binary_masks" / f"{sample_name}.npz")
@@ -624,6 +635,7 @@ def save_visualizations(
     figures_dir = figures_root / split
     figures_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"ranking done, writing {len(selections) * 3} panels to {figures_dir}")
     manifest = []
     for case_label, rank, row_idx in selections:
         row = delta_df.iloc[row_idx]
@@ -777,9 +789,28 @@ def main() -> int:
 
         pengwin_masks_dir = args.flowsdf_pred_root / args.split / "binary_masks_pengwin_convention"
         pengwin_masks_dir.mkdir(parents=True, exist_ok=True)
-        run_pengwin_reroute_shard(
+        run_reroute_shard(
             sample_names, gated_df, gated_df_pengwin, devices[0], args.flowsdf_checkpoint_dir,
             args.ode_steps, args.n_eval, args.batch_size, flowsdf_masks_dir, pengwin_masks_dir, args.skip_existing,
+            label="PENGWIN-absolute routing",
+        )
+
+    # --- Step 4c: small expert on every fragment (optional) --------------------
+    gated_df_all_small = None
+    all_small_masks_dir = None
+    if args.small_expert_only:
+        print("\n=== Step 4c: expert_small on every fragment ===")
+        gated_df_all_small = gated_df.copy()
+        gated_df_all_small["expert"] = "expert_small"
+        n_recompute = int((gated_df["expert"] != "expert_small").sum())
+        print(f"{n_recompute} / {len(gated_df)} fragments are not already expert_small and will be recomputed")
+
+        all_small_masks_dir = args.flowsdf_pred_root / args.split / "binary_masks_all_small"
+        all_small_masks_dir.mkdir(parents=True, exist_ok=True)
+        run_reroute_shard(
+            sample_names, gated_df, gated_df_all_small, devices[0], args.flowsdf_checkpoint_dir,
+            args.ode_steps, args.n_eval, args.batch_size, flowsdf_masks_dir, all_small_masks_dir, args.skip_existing,
+            label="expert_small on everything",
         )
 
     # --- Step 5: evaluation ----------------------------------------------------
@@ -801,13 +832,26 @@ def main() -> int:
     print(flowsdf_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
 
     if args.pengwin_reroute:
+        # Same baseline predictions as above, just re-grouped by the PENGWIN-absolute
+        # size labels instead of RAM-H1200-relative ones. Without this, comparing
+        # `baseline_df`'s expert_large row (mixes flipped + non-flipped fragments)
+        # against `pengwin_df`'s expert_large row (non-flipped only) is apples-to-oranges --
+        # this gives the exact, directly-computed non-flipped baseline instead of
+        # backing it out algebraically from group means and counts.
+        baseline_df_pengwin = evaluate_predictions(medsam_pred_records, args.medsam_pred_root / args.split / "binary_masks", gated_df_pengwin, desc="eval: MedSAM baseline (PENGWIN-absolute grouping)")
+        baseline_df_pengwin.to_csv(eval_dir / "evaluation_medsam_baseline_pengwin_convention.csv", index=False)
+
         pengwin_df = evaluate_predictions(medsam_pred_records, pengwin_masks_dir, gated_df_pengwin, desc="eval: FlowSDF (PENGWIN-absolute)")
         pengwin_df.to_csv(eval_dir / "evaluation_flowsdf_pengwin_convention.csv", index=False)
 
+        print("\nMedSAM baseline, PENGWIN-absolute grouping, by (new) size group:")
+        print(baseline_df_pengwin.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
         print("\nMedSAM + frozen FlowSDF, PENGWIN-absolute routing (overall):")
         print(pengwin_df[["dice", "iou", "hd95", "assd"]].mean())
         print("\nMedSAM + frozen FlowSDF, PENGWIN-absolute routing, by (new) size group:")
         print(pengwin_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
+        print("\n-> compare the two tables above row-by-row (same size_group labels, "
+              "baseline vs. refined) for the scale-controlled regression/improvement per group.")
 
         # Isolate the effect: for exactly the fragments that flip expert, compare
         # baseline vs. old (RAM-H1200-relative) refined vs. new (PENGWIN-absolute)
@@ -842,6 +886,23 @@ def main() -> int:
         flipped_df = pd.DataFrame(flipped_rows)
         flipped_df.to_csv(eval_dir / "evaluation_flipped_fragments.csv", index=False)
         print(flipped_df[["baseline_dice", "expert_large_dice", "expert_small_dice"]].mean())
+
+    if args.small_expert_only:
+        # Evaluated against the ORIGINAL (RAM-H1200-relative) size groups, not
+        # regrouped -- the point is to see how expert_small does on fragments that
+        # were never meant for it, including the genuinely-large ones, not to
+        # relabel everything "small" and hide the comparison.
+        all_small_df = evaluate_predictions(medsam_pred_records, all_small_masks_dir, gated_df, desc="eval: expert_small on everything")
+        all_small_df.to_csv(eval_dir / "evaluation_flowsdf_all_small.csv", index=False)
+
+        print("\nMedSAM + frozen FlowSDF, expert_small on EVERY fragment (overall):")
+        print(all_small_df[["dice", "iou", "hd95", "assd"]].mean())
+        print("\nMedSAM + frozen FlowSDF, expert_small on EVERY fragment, by original size group:")
+        print(all_small_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
+        print("\n-> compare the expert_large row above against 'MedSAM + frozen FlowSDF by size group' "
+              "(Step 5's primary table) and 'MedSAM baseline by size group' to see whether forcing "
+              "the small expert onto originally-large fragments helps, hurts, or is a wash relative "
+              "to both the baseline and the (wrong) large expert.")
 
     # --- Step 6: visualizations (separate panels, not merged) ------------------
     print("\n=== Step 6: visualizations ===")
