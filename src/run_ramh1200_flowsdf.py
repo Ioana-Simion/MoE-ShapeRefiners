@@ -157,6 +157,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--custom-threshold", type=float, default=None,
+        help=(
+            "Additionally re-route fragments using an arbitrary absolute area threshold "
+            "(in px) instead of this dataset's relative median -- same mechanism as "
+            "--pengwin-reroute (only recomputes flipped fragments), but with a "
+            "user-supplied value. Intended for the quality-cliff threshold derived by "
+            "ramh1200_threshold_analysis.ipynb (RAM-H1200's own MedSAM-failure data, "
+            "same methodology as PENGWIN's original threshold, different value)."
+        ),
+    )
+    parser.add_argument(
         "--small-expert-only", action="store_true",
         help=(
             "Additionally force EVERY fragment through expert_small, regardless of area, "
@@ -430,14 +441,82 @@ def _flowsdf_worker(rank: int, device: str, sample_names: list[str], gated_df: p
 # fragments whose assignment actually changes). Used for both the
 # PENGWIN-absolute reroute and the "expert_small on everything" experiment.
 # ---------------------------------------------------------------------------
-def reroute_pengwin_convention(gated_df: pd.DataFrame) -> pd.DataFrame:
-    """Reassign expert using PENGWIN's absolute area threshold instead of this
-    dataset's own relative median. See notebook Section 11: PENGWIN's 5402px
-    threshold is their own 25th percentile fragment area, and RAM-H1200
-    fragments sit much lower on that absolute scale."""
+def reroute_to_area_threshold(gated_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Reassign expert using an arbitrary absolute area threshold instead of
+    this dataset's own relative median. Used for both --pengwin-reroute
+    (threshold=PENGWIN_SMALL_THRESHOLD, PENGWIN's own 25th-percentile fragment
+    area -- see notebook Section 11) and --custom-threshold (an arbitrary
+    value, e.g. from ramh1200_threshold_analysis.ipynb's quality-cliff
+    derivation on RAM-H1200's own MedSAM-failure data)."""
     rerouted = gated_df.copy()
-    rerouted["expert"] = np.where(rerouted["area"] <= PENGWIN_SMALL_THRESHOLD, "expert_small", "expert_large")
+    rerouted["expert"] = np.where(rerouted["area"] <= threshold, "expert_small", "expert_large")
     return rerouted
+
+
+def evaluate_threshold_reroute(
+    tag: str,
+    gated_df: pd.DataFrame,
+    gated_df_new: pd.DataFrame,
+    masks_dir: Path,
+    medsam_pred_records: list[dict],
+    medsam_pred_root: Path,
+    split: str,
+    flowsdf_masks_dir: Path,
+    eval_dir: Path,
+) -> None:
+    """Shared eval block for a threshold-reroute experiment (pengwin or
+    custom): baseline re-grouped by the new threshold (exact, not estimated),
+    refined masks evaluated under the new grouping, and the isolated
+    flipped-fragment before/after table. Used identically for
+    --pengwin-reroute and --custom-threshold so the two don't duplicate ~80
+    lines of near-identical logic."""
+    baseline_df_new = evaluate_predictions(
+        medsam_pred_records, medsam_pred_root / split / "binary_masks", gated_df_new,
+        desc=f"eval: MedSAM baseline ({tag} grouping)",
+    )
+    baseline_df_new.to_csv(eval_dir / f"evaluation_medsam_baseline_{tag}.csv", index=False)
+
+    refined_df = evaluate_predictions(medsam_pred_records, masks_dir, gated_df_new, desc=f"eval: FlowSDF ({tag})")
+    refined_df.to_csv(eval_dir / f"evaluation_flowsdf_{tag}.csv", index=False)
+
+    print(f"\nMedSAM baseline, {tag} grouping, by (new) size group:")
+    print(baseline_df_new.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
+    print(f"\nMedSAM + frozen FlowSDF, {tag} routing (overall):")
+    print(refined_df[["dice", "iou", "hd95", "assd"]].mean())
+    print(f"\nMedSAM + frozen FlowSDF, {tag} routing, by (new) size group:")
+    print(refined_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
+    print(f"\n-> compare the two tables above row-by-row (same size_group labels, "
+          f"baseline vs. refined) for the scale-controlled regression/improvement per group ({tag}).")
+
+    flipped_keys = set(
+        map(tuple, gated_df_new.loc[
+            gated_df_new["expert"] != gated_df["expert"], ["sample_name", "medsam_instance_id"]
+        ].values)
+    )
+    print(f"\nIsolating the {len(flipped_keys)} flipped fragments ({tag}):")
+    flipped_rows = []
+    for sample_name in tqdm({k[0] for k in flipped_keys}, desc=f"eval: flipped fragments ({tag})"):
+        record = next(r for r in medsam_pred_records if r["sample_name"] == sample_name)
+        gt_masks = np.load(record["gt_masks_path"])["masks"]
+        baseline_masks = load_prediction_masks(medsam_pred_root / split / "binary_masks" / f"{sample_name}.npz")
+        old_masks = load_prediction_masks(flowsdf_masks_dir / f"{sample_name}.npz")
+        new_masks = load_prediction_masks(masks_dir / f"{sample_name}.npz")
+
+        for frag in record["fragments"]:
+            key = (sample_name, frag["medsam_instance_id"])
+            if key not in flipped_keys:
+                continue
+            idx = frag["medsam_instance_id"] - 1
+            gt = gt_masks[idx]
+            flipped_rows.append({
+                "sample_name": sample_name,
+                "baseline_dice": dice_score(resize_binary_nearest(baseline_masks[idx], gt.shape), gt),
+                "expert_large_dice": dice_score(resize_binary_nearest(old_masks[idx], gt.shape), gt),
+                "expert_small_dice": dice_score(resize_binary_nearest(new_masks[idx], gt.shape), gt),
+            })
+    flipped_df = pd.DataFrame(flipped_rows)
+    flipped_df.to_csv(eval_dir / f"evaluation_flipped_fragments_{tag}.csv", index=False)
+    print(flipped_df[["baseline_dice", "expert_large_dice", "expert_small_dice"]].mean())
 
 
 def run_reroute_shard(
@@ -597,11 +676,24 @@ def save_visualizations(
     split: str,
     figures_root: Path,
     n_each: int,
-) -> None:
+    tag: str,
+) -> list[dict]:
+    """Save the top-n_each *best* cases (by dice delta vs. baseline) for one
+    routing convention's refined masks. Only "best" -- not worst/median -- since
+    those turned out not to be the informative comparison once multiple routing
+    conventions are being run side by side.
+
+    `tag` identifies which routing convention/experiment produced flowsdf_masks_dir
+    (e.g. "primary_ram_h1200_relative", "pengwin", "custom", "all_small") -- it's
+    embedded in every filename and manifest row so a saved PNG is never ambiguous
+    about which run it came from. Returns the manifest rows for this call; the
+    caller is responsible for combining rows across multiple tags/calls into one
+    manifest.csv (this function does not write its own).
+    """
     records_by_name = {r["sample_name"]: r for r in medsam_pred_records}
 
     delta_rows = []
-    for record in tqdm(medsam_pred_records, desc="ranking images for worst/median/best"):
+    for record in tqdm(medsam_pred_records, desc=f"ranking images [{tag}]"):
         sample_name = record["sample_name"]
         gt_masks = np.load(record["gt_masks_path"])["masks"]
         baseline_masks = load_prediction_masks(medsam_pred_root / split / "binary_masks" / f"{sample_name}.npz")
@@ -622,22 +714,17 @@ def save_visualizations(
 
     delta_df = pd.DataFrame(delta_rows).sort_values("delta").reset_index(drop=True)
     n = len(delta_df)
-    n_each = min(n_each, n // 2 if n >= 2 else 1)
+    n_each = min(n_each, n) if n >= 1 else 0
 
-    median_start = max(0, n // 2 - n_each // 2)
-    # (case_label, rank_within_case (1-based, for the filename), row index into delta_df)
-    selections = (
-        [("worst", rank, i) for rank, i in enumerate(range(n_each), start=1)]
-        + [("median", rank, i) for rank, i in enumerate(range(median_start, median_start + n_each), start=1)]
-        + [("best", rank, i) for rank, i in enumerate(range(n - n_each, n), start=1)]
-    )
+    # (rank_within_case (1-based, for the filename), row index into delta_df)
+    selections = [(rank, i) for rank, i in enumerate(range(n - n_each, n), start=1)]
 
     figures_dir = figures_root / split
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"ranking done, writing {len(selections) * 3} panels to {figures_dir}")
+    print(f"[{tag}] ranking done, writing {len(selections) * 3} panels to {figures_dir}")
     manifest = []
-    for case_label, rank, row_idx in selections:
+    for rank, row_idx in selections:
         row = delta_df.iloc[row_idx]
         sample_name = row["sample_name"]
         record = records_by_name[sample_name]
@@ -648,13 +735,14 @@ def save_visualizations(
         flowsdf_masks = load_prediction_masks(flowsdf_masks_dir / f"{sample_name}.npz")
 
         for method_label, masks in [("gt", gt_masks), ("medsam_baseline", baseline_masks), ("flowsdf_refined", flowsdf_masks)]:
-            # naming: {case}{rank}_{sample_id}_{method}.png -- sample_id (scan) and
-            # case/method are both in the filename so either can be grepped for.
-            out_name = f"{case_label}{rank}_{sample_name}_{method_label}.png"
+            # naming: best{rank}_{tag}_{sample_id}_{method}.png -- tag identifies
+            # which routing convention produced this, so it's never ambiguous later.
+            out_name = f"best{rank}_{tag}_{sample_name}_{method_label}.png"
             out_path = figures_dir / out_name
             save_panel(image, masks, out_path)
             manifest.append({
-                "case": case_label,
+                "source": tag,
+                "case": "best",
                 "rank_within_case": rank,
                 "sample_name": sample_name,
                 "method": method_label,
@@ -664,9 +752,8 @@ def save_visualizations(
                 "path": str(out_path),
             })
 
-    manifest_df = pd.DataFrame(manifest)
-    manifest_df.to_csv(figures_dir / "manifest.csv", index=False)
-    print(f"saved {len(manifest)} panels to {figures_dir}")
+    print(f"[{tag}] saved {len(manifest)} panels")
+    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -775,14 +862,15 @@ def main() -> int:
             if p.exitcode != 0:
                 raise RuntimeError(f"FlowSDF worker failed with exit code {p.exitcode}")
 
+    eval_dir = args.flowsdf_pred_root / args.split
+    eval_dir.mkdir(parents=True, exist_ok=True)
+
     # --- Step 4b: PENGWIN-absolute reroute (optional) --------------------------
-    gated_df_pengwin = None
-    pengwin_masks_dir = None
+    reroute_outputs: dict[str, dict] = {}  # tag -> {"gated_df": ..., "masks_dir": ...}, for Step 6
     if args.pengwin_reroute:
         print(f"\n=== Step 4b: PENGWIN-absolute reroute (threshold={PENGWIN_SMALL_THRESHOLD:.0f}px) ===")
-        gated_df_pengwin = reroute_pengwin_convention(gated_df)
-        pengwin_csv_path = gating_dir / f"gated_ramh1200_flowsdf_pengwin_{args.split}_records.csv"
-        gated_df_pengwin.to_csv(pengwin_csv_path, index=False)
+        gated_df_pengwin = reroute_to_area_threshold(gated_df, PENGWIN_SMALL_THRESHOLD)
+        gated_df_pengwin.to_csv(gating_dir / f"gated_ramh1200_flowsdf_pengwin_{args.split}_records.csv", index=False)
         changed = int((gated_df_pengwin["expert"] != gated_df["expert"]).sum())
         print(f"{changed} / {len(gated_df)} fragments change expert assignment ({changed / len(gated_df):.1%})")
         print(gated_df_pengwin["expert"].value_counts().to_string())
@@ -794,10 +882,9 @@ def main() -> int:
             args.ode_steps, args.n_eval, args.batch_size, flowsdf_masks_dir, pengwin_masks_dir, args.skip_existing,
             label="PENGWIN-absolute routing",
         )
+        reroute_outputs["pengwin"] = {"gated_df": gated_df_pengwin, "masks_dir": pengwin_masks_dir}
 
     # --- Step 4c: small expert on every fragment (optional) --------------------
-    gated_df_all_small = None
-    all_small_masks_dir = None
     if args.small_expert_only:
         print("\n=== Step 4c: expert_small on every fragment ===")
         gated_df_all_small = gated_df.copy()
@@ -812,13 +899,31 @@ def main() -> int:
             args.ode_steps, args.n_eval, args.batch_size, flowsdf_masks_dir, all_small_masks_dir, args.skip_existing,
             label="expert_small on everything",
         )
+        reroute_outputs["all_small"] = {"gated_df": gated_df, "masks_dir": all_small_masks_dir}
+
+    # --- Step 4d: custom-threshold reroute (optional) ---------------------------
+    if args.custom_threshold is not None:
+        print(f"\n=== Step 4d: custom-threshold reroute (threshold={args.custom_threshold:.1f}px) ===")
+        gated_df_custom = reroute_to_area_threshold(gated_df, args.custom_threshold)
+        gated_df_custom.to_csv(gating_dir / f"gated_ramh1200_flowsdf_custom_{args.split}_records.csv", index=False)
+        changed = int((gated_df_custom["expert"] != gated_df["expert"]).sum())
+        print(f"{changed} / {len(gated_df)} fragments change expert assignment ({changed / len(gated_df):.1%})")
+        print(gated_df_custom["expert"].value_counts().to_string())
+
+        custom_masks_dir = args.flowsdf_pred_root / args.split / "binary_masks_custom_threshold"
+        custom_masks_dir.mkdir(parents=True, exist_ok=True)
+        run_reroute_shard(
+            sample_names, gated_df, gated_df_custom, devices[0], args.flowsdf_checkpoint_dir,
+            args.ode_steps, args.n_eval, args.batch_size, flowsdf_masks_dir, custom_masks_dir, args.skip_existing,
+            label="custom-threshold routing",
+        )
+        reroute_outputs["custom"] = {"gated_df": gated_df_custom, "masks_dir": custom_masks_dir}
 
     # --- Step 5: evaluation ----------------------------------------------------
     print("\n=== Step 5: evaluation ===")
     baseline_df = evaluate_predictions(medsam_pred_records, args.medsam_pred_root / args.split / "binary_masks", gated_df, desc="eval: MedSAM baseline")
     flowsdf_df = evaluate_predictions(medsam_pred_records, flowsdf_masks_dir, gated_df, desc="eval: FlowSDF (RAM-H1200-relative)")
 
-    eval_dir = args.flowsdf_pred_root / args.split
     baseline_df.to_csv(eval_dir / "evaluation_medsam_baseline.csv", index=False)
     flowsdf_df.to_csv(eval_dir / "evaluation_flowsdf.csv", index=False)
 
@@ -832,67 +937,23 @@ def main() -> int:
     print(flowsdf_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
 
     if args.pengwin_reroute:
-        # Same baseline predictions as above, just re-grouped by the PENGWIN-absolute
-        # size labels instead of RAM-H1200-relative ones. Without this, comparing
-        # `baseline_df`'s expert_large row (mixes flipped + non-flipped fragments)
-        # against `pengwin_df`'s expert_large row (non-flipped only) is apples-to-oranges --
-        # this gives the exact, directly-computed non-flipped baseline instead of
-        # backing it out algebraically from group means and counts.
-        baseline_df_pengwin = evaluate_predictions(medsam_pred_records, args.medsam_pred_root / args.split / "binary_masks", gated_df_pengwin, desc="eval: MedSAM baseline (PENGWIN-absolute grouping)")
-        baseline_df_pengwin.to_csv(eval_dir / "evaluation_medsam_baseline_pengwin_convention.csv", index=False)
-
-        pengwin_df = evaluate_predictions(medsam_pred_records, pengwin_masks_dir, gated_df_pengwin, desc="eval: FlowSDF (PENGWIN-absolute)")
-        pengwin_df.to_csv(eval_dir / "evaluation_flowsdf_pengwin_convention.csv", index=False)
-
-        print("\nMedSAM baseline, PENGWIN-absolute grouping, by (new) size group:")
-        print(baseline_df_pengwin.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
-        print("\nMedSAM + frozen FlowSDF, PENGWIN-absolute routing (overall):")
-        print(pengwin_df[["dice", "iou", "hd95", "assd"]].mean())
-        print("\nMedSAM + frozen FlowSDF, PENGWIN-absolute routing, by (new) size group:")
-        print(pengwin_df.groupby("size_group")[["dice", "iou", "hd95", "assd"]].mean())
-        print("\n-> compare the two tables above row-by-row (same size_group labels, "
-              "baseline vs. refined) for the scale-controlled regression/improvement per group.")
-
-        # Isolate the effect: for exactly the fragments that flip expert, compare
-        # baseline vs. old (RAM-H1200-relative) refined vs. new (PENGWIN-absolute)
-        # refined, fragment by fragment -- holds the fragment set fixed and only
-        # changes which expert refined it.
-        flipped_keys = set(
-            map(tuple, gated_df_pengwin.loc[
-                gated_df_pengwin["expert"] != gated_df["expert"], ["sample_name", "medsam_instance_id"]
-            ].values)
+        evaluate_threshold_reroute(
+            "pengwin", gated_df, reroute_outputs["pengwin"]["gated_df"], reroute_outputs["pengwin"]["masks_dir"],
+            medsam_pred_records, args.medsam_pred_root, args.split, flowsdf_masks_dir, eval_dir,
         )
-        print(f"\nIsolating the {len(flipped_keys)} flipped fragments:")
-        flipped_rows = []
-        for sample_name in tqdm({k[0] for k in flipped_keys}, desc="eval: flipped fragments"):
-            record = next(r for r in medsam_pred_records if r["sample_name"] == sample_name)
-            gt_masks = np.load(record["gt_masks_path"])["masks"]
-            baseline_masks = load_prediction_masks(args.medsam_pred_root / args.split / "binary_masks" / f"{sample_name}.npz")
-            old_masks = load_prediction_masks(flowsdf_masks_dir / f"{sample_name}.npz")
-            new_masks = load_prediction_masks(pengwin_masks_dir / f"{sample_name}.npz")
 
-            for frag in record["fragments"]:
-                key = (sample_name, frag["medsam_instance_id"])
-                if key not in flipped_keys:
-                    continue
-                idx = frag["medsam_instance_id"] - 1
-                gt = gt_masks[idx]
-                flipped_rows.append({
-                    "sample_name": sample_name,
-                    "baseline_dice": dice_score(resize_binary_nearest(baseline_masks[idx], gt.shape), gt),
-                    "expert_large_dice": dice_score(resize_binary_nearest(old_masks[idx], gt.shape), gt),
-                    "expert_small_dice": dice_score(resize_binary_nearest(new_masks[idx], gt.shape), gt),
-                })
-        flipped_df = pd.DataFrame(flipped_rows)
-        flipped_df.to_csv(eval_dir / "evaluation_flipped_fragments.csv", index=False)
-        print(flipped_df[["baseline_dice", "expert_large_dice", "expert_small_dice"]].mean())
+    if args.custom_threshold is not None:
+        evaluate_threshold_reroute(
+            "custom", gated_df, reroute_outputs["custom"]["gated_df"], reroute_outputs["custom"]["masks_dir"],
+            medsam_pred_records, args.medsam_pred_root, args.split, flowsdf_masks_dir, eval_dir,
+        )
 
     if args.small_expert_only:
         # Evaluated against the ORIGINAL (RAM-H1200-relative) size groups, not
         # regrouped -- the point is to see how expert_small does on fragments that
         # were never meant for it, including the genuinely-large ones, not to
         # relabel everything "small" and hide the comparison.
-        all_small_df = evaluate_predictions(medsam_pred_records, all_small_masks_dir, gated_df, desc="eval: expert_small on everything")
+        all_small_df = evaluate_predictions(medsam_pred_records, reroute_outputs["all_small"]["masks_dir"], gated_df, desc="eval: expert_small on everything")
         all_small_df.to_csv(eval_dir / "evaluation_flowsdf_all_small.csv", index=False)
 
         print("\nMedSAM + frozen FlowSDF, expert_small on EVERY fragment (overall):")
@@ -905,11 +966,26 @@ def main() -> int:
               "to both the baseline and the (wrong) large expert.")
 
     # --- Step 6: visualizations (separate panels, not merged) ------------------
+    # One combined manifest.csv across every routing convention that ran this time,
+    # each panel/row tagged with its source so it's unambiguous when reporting later
+    # which experiment (median split / PENGWIN-absolute / custom threshold / all-small)
+    # a given image actually came from.
     print("\n=== Step 6: visualizations ===")
-    save_visualizations(
+    all_manifest_rows = []
+    all_manifest_rows += save_visualizations(
         medsam_pred_records, args.medsam_pred_root, flowsdf_masks_dir,
-        args.split, args.figures_root, args.n_viz_each,
+        args.split, args.figures_root, args.n_viz_each, tag="primary_ram_h1200_relative",
     )
+    for tag, info in reroute_outputs.items():
+        all_manifest_rows += save_visualizations(
+            medsam_pred_records, args.medsam_pred_root, info["masks_dir"],
+            args.split, args.figures_root, args.n_viz_each, tag=tag,
+        )
+
+    manifest_df = pd.DataFrame(all_manifest_rows)
+    manifest_path = args.figures_root / args.split / "manifest.csv"
+    manifest_df.to_csv(manifest_path, index=False)
+    print(f"wrote combined manifest ({len(manifest_df)} rows) -> {manifest_path}")
 
     elapsed = time.time() - t0
     print(f"\ntotal elapsed: {elapsed / 3600:.2f} hours")
