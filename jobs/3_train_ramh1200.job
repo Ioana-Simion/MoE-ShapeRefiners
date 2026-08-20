@@ -1,0 +1,78 @@
+#!/bin/bash
+#SBATCH --job-name=MoE-train
+#SBATCH --partition=avicenna
+#SBATCH --account=avicennausers
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --time=2-00:00:00
+#SBATCH --chdir=/home/isimion/MoE-ShapeRefiners
+#SBATCH --output=logs/train-%j.out
+
+# Job 3 of 3: build the gated train/val CSVs at the threshold job 2 derived,
+# then train. Requires 1_prepare_ramh1200_training_data.job and
+# 2_ramh1200_threshold_analysis.job to have finished.
+#
+# EXPERT_TYPE picks which training script -- cnnNoROI is much cheaper
+# (~1/3 the code, no EMA/bf16/resume complexity) and a reasonable first
+# choice to validate the whole pipeline before committing to the heavier
+# FlowSDF run. Override at submit time:
+#   sbatch --export=EXPERT_TYPE=flowsdf jobs/3_train_ramh1200.job
+
+set -euo pipefail
+
+module purge
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate fusion3d
+pip install segment-anything
+
+mkdir -p logs
+
+EXPERT_TYPE="${EXPERT_TYPE:-cnnnoroi}"   # cnnnoroi | flowsdf
+
+# --- read the threshold job 2 derived (no manual copy-paste) ----------------
+THRESHOLD_FILE="data/ramh1200/gating_threshold_train.txt"
+if [ ! -f "$THRESHOLD_FILE" ]; then
+    echo "ERROR: $THRESHOLD_FILE not found -- run 2_ramh1200_threshold_analysis.job first."
+    exit 1
+fi
+THRESHOLD=$(cat "$THRESHOLD_FILE")
+echo "using threshold: ${THRESHOLD}px (from $THRESHOLD_FILE)"
+
+# --- build gated CSVs at that threshold --------------------------------------
+python src/gating_mechanism/ramh1200_dataset.py --split train --threshold "$THRESHOLD"
+python src/gating_mechanism/ramh1200_dataset.py --split val   --threshold "$THRESHOLD"
+
+# LARGE_SUBSAMPLE: check the expert_small/expert_large counts printed by the
+# two commands above before setting this. PENGWIN's own training used
+# --large-subsample 17000 against a 194591:17335 imbalance -- RAM-H1200's is
+# likely much smaller (or absent), don't assume it's needed. Override at
+# submit time: sbatch --export=EXPERT_TYPE=cnnnoroi,LARGE_SUBSAMPLE=8000 ...
+LARGE_SUBSAMPLE_ARGS=()
+if [ -n "${LARGE_SUBSAMPLE:-}" ]; then
+    LARGE_SUBSAMPLE_ARGS=(--large-subsample "$LARGE_SUBSAMPLE")
+fi
+
+# --- train ---------------------------------------------------------------------
+if [ "$EXPERT_TYPE" = "flowsdf" ]; then
+    python src/FlowSDF/train_flowsdf_ramh1200.py \
+        --expert both \
+        --epochs 100 \
+        --batch-size 8 \
+        --checkpoint-dir checkpoints/flowsdf_ramh1200 \
+        --wandb-project moe-shaprefine \
+        "${LARGE_SUBSAMPLE_ARGS[@]}"
+else
+    python src/cnnNoROI/train_moe_ramh1200.py \
+        --expert both \
+        --epochs 20 \
+        --batch-size 64 \
+        --checkpoint-dir checkpoints/cnnNoROI_ramh1200 \
+        --wandb-project moe-shaprefine \
+        "${LARGE_SUBSAMPLE_ARGS[@]}"
+fi
+
+echo "========================================"
+echo "end : $(date)"
+echo "========================================"

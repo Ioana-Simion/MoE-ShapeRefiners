@@ -1,0 +1,40 @@
+#!/bin/bash
+#SBATCH --job-name=MoE-threshold
+#SBATCH --partition=avicenna
+#SBATCH --account=avicennausers
+#SBATCH --gres=gpu:0
+#SBATCH --ntasks=1
+#SBATCH --mem=32G
+#SBATCH --cpus-per-task=4
+#SBATCH --time=1:00:00
+#SBATCH --chdir=/home/isimion/MoE-ShapeRefiners
+#SBATCH --output=logs/threshold-analysis-%j.out
+
+# Job 2 of 3: derive the gating threshold from RAM-H1200's own TRAIN-split
+# MedSAM-failure data (script version of ramh1200_threshold_analysis.ipynb --
+# same methodology PENGWIN's own 5402px threshold came from: a rolling
+# dice-vs-area quality-cliff analysis, not just the median). Requires
+# 1_prepare_ramh1200_training_data.job to have finished.
+#
+# No GPU needed -- this is pandas/numpy/matplotlib over already-computed
+# MedSAM predictions, hence --gres=gpu:0. If your cluster requires gres>=1
+# for the avicenna partition, change this to --gres=gpu:1 (the job just
+# won't use it).
+#
+# Writes data/ramh1200/gating_threshold_train.txt (a single number, read
+# automatically by 3_train_ramh1200.job -- no manual copy-paste needed).
+
+set -euo pipefail
+
+module purge
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate fusion3d
+
+mkdir -p logs
+
+python src/ramh1200_threshold_analysis.py --split train
+
+echo "========================================"
+echo "derived threshold: $(cat data/ramh1200/gating_threshold_train.txt)"
+echo "end : $(date)"
+echo "========================================"

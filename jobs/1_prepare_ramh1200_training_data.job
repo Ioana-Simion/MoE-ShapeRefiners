@@ -1,0 +1,42 @@
+#!/bin/bash
+#SBATCH --job-name=MoE-prep
+#SBATCH --partition=avicenna
+#SBATCH --account=avicennausers
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --time=4:00:00
+#SBATCH --chdir=/home/isimion/MoE-ShapeRefiners
+#SBATCH --output=logs/prepare-training-data-%j.out
+
+# Job 1 of 3: MedSAM embeddings + masks for RAM-H1200 train/val, so training
+# can start right on this data on the cluster (no laptop-side prep needed --
+# this is ~793 train images + val, each a MedSAM ViT-B forward pass, too much
+# for a laptop's MPS backend, and this cluster job produces exactly the
+# embeddings/masks training will read anyway).
+#
+# Next: 2_ramh1200_threshold_analysis.job (derives the routing threshold from
+# this job's train-split output), then 3_train_ramh1200.job.
+
+echo "set no memory constraint"
+
+set -euo pipefail
+
+module purge
+# module load 2023
+# module load PyTorch/2.1.2-foss-2023a-CUDA-12.1.1
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate fusion3d
+#pip install pycocotools
+pip install segment-anything
+
+mkdir -p logs
+
+python src/prepare_ramh1200_training_data.py \
+    --splits train val \
+    --skip-existing
+
+echo "========================================"
+echo "end : $(date)"
+echo "========================================"
