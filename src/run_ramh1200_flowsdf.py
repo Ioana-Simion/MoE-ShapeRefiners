@@ -691,38 +691,60 @@ def save_panel(image: np.ndarray, masks: np.ndarray, out_path: Path) -> None:
     plt.close(fig)
 
 
-def colorize_diff(ours_masks_1024: np.ndarray, medsam_masks_1024: np.ndarray, gt_masks_native: np.ndarray) -> np.ndarray:
-    """Union across all fragments in the image, then:
-        green = our mask AND gt (pixels our prediction gets right)
-        red   = MedSAM's mask footprint (regardless of correctness)
-    Green is drawn on top (more opaque) so overlap with red is still visibly
-    green, not muddied -- the point is "does our correct coverage extend
-    past/differ from MedSAM's raw coverage", not a 4-way TP/FP/FN breakdown.
+def _combine_masks(masks_1024: np.ndarray, gt_shape: tuple[int, int]) -> np.ndarray:
+    """Union across all fragments, resized down to gt's native resolution --
+    same convention evaluate_predictions() uses (metric_space="original")."""
+    combined = np.zeros(gt_shape, dtype=bool)
+    for i in range(masks_1024.shape[0]):
+        combined |= resize_binary_nearest(masks_1024[i], gt_shape).astype(bool)
+    return combined
 
-    ours/medsam masks are on the 1024 prediction grid; gt is at the image's
-    native resolution (varies per image) -- resized down to match gt's
-    resolution before combining, same convention evaluate_predictions() uses
-    (metric_space="original")."""
+
+def colorize_correctness(pred_masks_1024: np.ndarray, gt_masks_native: np.ndarray) -> np.ndarray:
+    """Single-method correctness overlay against GT, union across fragments:
+        green = correct coverage (pred AND gt)
+        red   = error (pred XOR gt -- false positives and false negatives alike)
+    Use this once per method (ours, MedSAM) so each panel is self-contained:
+    "how much of this mask is right vs. wrong," independent of the other method."""
     gt_shape = gt_masks_native.shape[1:]
-
-    ours_combined = np.zeros(gt_shape, dtype=bool)
-    for i in range(ours_masks_1024.shape[0]):
-        ours_combined |= resize_binary_nearest(ours_masks_1024[i], gt_shape).astype(bool)
-
-    medsam_combined = np.zeros(gt_shape, dtype=bool)
-    for i in range(medsam_masks_1024.shape[0]):
-        medsam_combined |= resize_binary_nearest(medsam_masks_1024[i], gt_shape).astype(bool)
-
+    pred_combined = _combine_masks(pred_masks_1024, gt_shape)
     gt_combined = np.any(gt_masks_native.astype(bool), axis=0)
-    green_region = ours_combined & gt_combined
 
     overlay = np.zeros((*gt_shape, 4))
-    overlay[medsam_combined] = [1.0, 0.0, 0.0, 0.35]
-    overlay[green_region] = [0.0, 1.0, 0.0, 0.55]
+    overlay[pred_combined ^ gt_combined] = [1.0, 0.0, 0.0, 0.45]
+    overlay[pred_combined & gt_combined] = [0.0, 1.0, 0.0, 0.55]
     return overlay
 
 
-def save_diff_panel(image: np.ndarray, ours_masks_1024: np.ndarray, medsam_masks_1024: np.ndarray, gt_masks_native: np.ndarray, out_path: Path) -> None:
+def colorize_improvement(ours_masks_1024: np.ndarray, medsam_masks_1024: np.ndarray, gt_masks_native: np.ndarray) -> np.ndarray:
+    """Joint panel that isolates where the two methods *disagree about being
+    right*, rather than just overlaying raw footprints:
+        pink = we're right where MedSAM is wrong here (our improvement)
+        blue = MedSAM is right where we're wrong here (our regression)
+        gray = both wrong here (shared failure, dim, for context)
+    Deliberately not green/red: this isn't a correctness panel (see
+    colorize_correctness for that), it's "which method wins here" -- using
+    green/red would read as good/bad rather than ours/theirs.
+    Pixels where both are correct (or both are background) are left blank --
+    that's agreement, not signal."""
+    gt_shape = gt_masks_native.shape[1:]
+    ours_combined = _combine_masks(ours_masks_1024, gt_shape)
+    medsam_combined = _combine_masks(medsam_masks_1024, gt_shape)
+    gt_combined = np.any(gt_masks_native.astype(bool), axis=0)
+
+    ours_correct = ours_combined == gt_combined
+    medsam_correct = medsam_combined == gt_combined
+    ours_wrong = ~ours_correct
+    medsam_wrong = ~medsam_correct
+
+    overlay = np.zeros((*gt_shape, 4))
+    overlay[ours_wrong & medsam_wrong] = [0.5, 0.5, 0.5, 0.35]
+    overlay[medsam_correct & ours_wrong] = [0.20, 0.55, 1.0, 0.5]
+    overlay[ours_correct & medsam_wrong] = [1.0, 0.35, 0.70, 0.55]
+    return overlay
+
+
+def _save_overlay_panel(image: np.ndarray, overlay: np.ndarray, out_path: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -730,11 +752,19 @@ def save_diff_panel(image: np.ndarray, ours_masks_1024: np.ndarray, medsam_masks
     h, w = image.shape
     fig, ax = plt.subplots(figsize=(w / 150, h / 150), dpi=150)
     ax.imshow(image, cmap="gray", extent=(0, w, h, 0))
-    ax.imshow(colorize_diff(ours_masks_1024, medsam_masks_1024, gt_masks_native), extent=(0, w, h, 0))
+    ax.imshow(overlay, extent=(0, w, h, 0))
     ax.axis("off")
     ax.set_position([0, 0, 1, 1])
     fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
+
+
+def save_correctness_panel(image: np.ndarray, pred_masks_1024: np.ndarray, gt_masks_native: np.ndarray, out_path: Path) -> None:
+    _save_overlay_panel(image, colorize_correctness(pred_masks_1024, gt_masks_native), out_path)
+
+
+def save_improvement_panel(image: np.ndarray, ours_masks_1024: np.ndarray, medsam_masks_1024: np.ndarray, gt_masks_native: np.ndarray, out_path: Path) -> None:
+    _save_overlay_panel(image, colorize_improvement(ours_masks_1024, medsam_masks_1024, gt_masks_native), out_path)
 
 
 def save_visualizations(
@@ -790,7 +820,7 @@ def save_visualizations(
     figures_dir = figures_root / split
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[{tag}] ranking done, writing {len(selections) * 4} panels to {figures_dir}")
+    print(f"[{tag}] ranking done, writing {len(selections) * 6} panels to {figures_dir}")
     manifest = []
     for rank, row_idx in selections:
         row = delta_df.iloc[row_idx]
@@ -820,22 +850,39 @@ def save_visualizations(
                 "path": str(out_path),
             })
 
-        # Fourth panel: green = our mask correct vs GT, red = MedSAM's mask
-        # footprint, unioned across every fragment in the image (not one
-        # fragment at a time like the panels above).
-        diff_out_name = f"best{rank}_{tag}_{sample_name}_ours_vs_medsam_diff.png"
-        diff_out_path = figures_dir / diff_out_name
-        save_diff_panel(image, flowsdf_masks, baseline_masks, gt_masks, diff_out_path)
+        # Correctness panels: green = correct vs GT, red = error vs GT
+        # (FP+FN), one per method so each is self-contained; unioned across
+        # every fragment in the image (not one fragment at a time like the
+        # panels above).
+        for method_label, masks in [("flowsdf_correctness", flowsdf_masks), ("medsam_correctness", baseline_masks)]:
+            correctness_out_path = figures_dir / f"best{rank}_{tag}_{sample_name}_{method_label}.png"
+            save_correctness_panel(image, masks, gt_masks, correctness_out_path)
+            manifest.append({
+                "source": tag,
+                "case": "best",
+                "rank_within_case": rank,
+                "sample_name": sample_name,
+                "method": method_label,
+                "base_dice": row["base_dice"],
+                "flowsdf_dice": row["flowsdf_dice"],
+                "delta": row["delta"],
+                "path": str(correctness_out_path),
+            })
+
+        # Joint improvement panel: green = we're right where MedSAM is wrong,
+        # red = MedSAM is right where we're wrong, gray = both wrong.
+        improvement_out_path = figures_dir / f"best{rank}_{tag}_{sample_name}_ours_vs_medsam_improvement.png"
+        save_improvement_panel(image, flowsdf_masks, baseline_masks, gt_masks, improvement_out_path)
         manifest.append({
             "source": tag,
             "case": "best",
             "rank_within_case": rank,
             "sample_name": sample_name,
-            "method": "ours_vs_medsam_diff",
+            "method": "ours_vs_medsam_improvement",
             "base_dice": row["base_dice"],
             "flowsdf_dice": row["flowsdf_dice"],
             "delta": row["delta"],
-            "path": str(diff_out_path),
+            "path": str(improvement_out_path),
         })
 
     print(f"[{tag}] saved {len(manifest)} panels")
