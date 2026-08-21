@@ -221,6 +221,10 @@ def train_expert(
     best_val_loss = float("inf")
     train_losses: list[float] = []
     val_losses:   list[float] = []
+    patience_counter = 0
+    early_stopping_on = args.early_stopping_patience > 0
+    stopped_early = False
+    epoch = 0  # defined even if args.epochs == 0, for the final-checkpoint save below
 
     for epoch in range(1, args.epochs + 1):
         tag = f"[{expert_id}] {epoch}/{args.epochs}"
@@ -239,23 +243,37 @@ def train_expert(
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
-        print(f"{tag}  train={train_loss:.4f}  val={val_loss:.4f}")
+        improved = val_loss < best_val_loss
+        if early_stopping_on:
+            patience_counter = 0 if improved else patience_counter + 1
 
-        wandb_log(
-            {f"{expert_id}/train_loss": train_loss, f"{expert_id}/val_loss": val_loss},
-            step=epoch,
-            active=wb_active,
-        )
+        patience_str = f"  patience={patience_counter}/{args.early_stopping_patience}" if early_stopping_on else ""
+        print(f"{tag}  train={train_loss:.4f}  val={val_loss:.4f}{patience_str}")
 
-        if val_loss < best_val_loss:
+        wandb_metrics = {f"{expert_id}/train_loss": train_loss, f"{expert_id}/val_loss": val_loss}
+        if early_stopping_on:
+            wandb_metrics[f"{expert_id}/early_stopping_patience_counter"] = patience_counter
+        wandb_log(wandb_metrics, step=epoch, active=wb_active)
+
+        if improved:
             best_val_loss = val_loss
             ckpt = args.checkpoint_dir / f"{expert_id}_best.pth"
             torch.save({"epoch": epoch, "model_state": model.state_dict(), "val_loss": val_loss}, ckpt)
             print(f"  -> best checkpoint: {ckpt}")
 
+        if early_stopping_on and patience_counter >= args.early_stopping_patience:
+            print(
+                f"[{expert_id}] Early stopping at epoch {epoch}: val_loss did not improve for "
+                f"{args.early_stopping_patience} consecutive epochs (best val_loss={best_val_loss:.4f})"
+            )
+            wandb_log({f"{expert_id}/early_stopped_epoch": epoch}, step=epoch, active=wb_active)
+            stopped_early = True
+            break
+
     final = args.checkpoint_dir / f"{expert_id}_final.pth"
-    torch.save({"epoch": args.epochs, "model_state": model.state_dict()}, final)
-    print(f"[{expert_id}] done. Final: {final}")
+    torch.save({"epoch": epoch, "model_state": model.state_dict(), "stopped_early": stopped_early}, final)
+    stop_reason = f"early stopping at epoch {epoch}" if stopped_early else f"completed {args.epochs} epochs"
+    print(f"[{expert_id}] done ({stop_reason}). Final: {final}")
 
     save_loss_curve(train_losses, val_losses, expert_id, args.checkpoint_dir)
     wandb_finish(wb_active)
@@ -278,6 +296,11 @@ def parse_args() -> argparse.Namespace:
                              "small/large counts in gated_ramh1200_train_records.csv first).")
     parser.add_argument("--checkpoint-dir",  type=Path,
                         default=PROJECT_ROOT / "checkpoints" / "cnnNoROI_ramh1200")
+    parser.add_argument("--early-stopping-patience", type=int, default=10,
+                        help="Stop training if val_loss does not improve for this many consecutive "
+                             "epochs. Set to 0 to disable. Not present in the original PENGWIN "
+                             "train_moe.py (which never had early stopping) -- added here to match "
+                             "FlowSDF's train_flowsdf_ramh1200.py, at the user's request.")
     # W&B
     parser.add_argument("--wandb-project", type=str, default="moe-shaprefine",
                         help="W&B project name.")
