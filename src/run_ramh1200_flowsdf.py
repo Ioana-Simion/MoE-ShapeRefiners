@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16, help="Fragments per batched FlowSDF forward pass (same expert).")
     parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs to shard images across via this script's own internal multiprocessing (one process, join()-based -- no cross-process sync needed). 1 = plain single-process run.")
     parser.add_argument("--limit", type=int, default=None, help="Process only the first N images (smoke test).")
-    parser.add_argument("--n-viz-each", type=int, default=3, help="How many worst/median/best cases to save panels for.")
+    parser.add_argument("--n-viz-each", type=int, default=3, help="How many best cases to save panels for (pass a bigger number, e.g. 5, to save more).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skip-existing", action="store_true", help="Skip MedSAM/FlowSDF outputs that already exist on disk.")
     parser.add_argument(
@@ -164,7 +164,22 @@ def parse_args() -> argparse.Namespace:
             "--pengwin-reroute (only recomputes flipped fragments), but with a "
             "user-supplied value. Intended for the quality-cliff threshold derived by "
             "ramh1200_threshold_analysis.ipynb (RAM-H1200's own MedSAM-failure data, "
-            "same methodology as PENGWIN's original threshold, different value)."
+            "same methodology as PENGWIN's original threshold, different value). "
+            "This is an ADDITIVE comparison pass on top of the median-routed primary "
+            "run below -- use --gating-threshold instead if you don't want the median "
+            "pass computed/evaluated at all."
+        ),
+    )
+    parser.add_argument(
+        "--gating-threshold", type=float, default=None,
+        help=(
+            "Skip computing the RAM-H1200-relative median entirely and make THIS value "
+            "the primary routing threshold (Steps 3/4/5) instead -- not an additive "
+            "reroute pass like --custom-threshold, a full replacement, so no median-routed "
+            "inference or eval happens at all. Use this when you only want one threshold "
+            "evaluated, e.g. a model trained specifically at one threshold, where the "
+            "median routing wouldn't even match what it was trained on and would just be "
+            "wasted compute."
         ),
     )
     parser.add_argument(
@@ -319,13 +334,20 @@ def _medsam_worker(rank: int, device: str, records: list[dict], checkpoint: Path
 # ---------------------------------------------------------------------------
 # Stage 2: gating (single process, needs the full shard-merged dataset)
 # ---------------------------------------------------------------------------
-def compute_gating(medsam_pred_records: list[dict]) -> tuple[pd.DataFrame, float]:
+def compute_gating(medsam_pred_records: list[dict], threshold_override: float | None = None) -> tuple[pd.DataFrame, float]:
+    """threshold_override: if set, skip computing the RAM-H1200-relative median
+    entirely and route on this value instead. Use this (via --gating-threshold)
+    when the median routing isn't wanted at all -- e.g. evaluating a model
+    trained at one specific threshold, where median-routed masks would be a
+    wasted, not-even-meaningful full inference pass. --custom-threshold/
+    --pengwin-reroute/--small-expert-only remain separate, additive reroute
+    experiments layered on top of whichever threshold this resolves to."""
     areas = []
     for record in medsam_pred_records:
         masks = load_prediction_masks(record["binary_masks_path"])
         for i in range(masks.shape[0]):
             areas.append(int(masks[i].sum()))
-    threshold = float(np.median(areas))
+    threshold = float(threshold_override) if threshold_override is not None else float(np.median(areas))
 
     rows = []
     for record in medsam_pred_records:
@@ -669,6 +691,52 @@ def save_panel(image: np.ndarray, masks: np.ndarray, out_path: Path) -> None:
     plt.close(fig)
 
 
+def colorize_diff(ours_masks_1024: np.ndarray, medsam_masks_1024: np.ndarray, gt_masks_native: np.ndarray) -> np.ndarray:
+    """Union across all fragments in the image, then:
+        green = our mask AND gt (pixels our prediction gets right)
+        red   = MedSAM's mask footprint (regardless of correctness)
+    Green is drawn on top (more opaque) so overlap with red is still visibly
+    green, not muddied -- the point is "does our correct coverage extend
+    past/differ from MedSAM's raw coverage", not a 4-way TP/FP/FN breakdown.
+
+    ours/medsam masks are on the 1024 prediction grid; gt is at the image's
+    native resolution (varies per image) -- resized down to match gt's
+    resolution before combining, same convention evaluate_predictions() uses
+    (metric_space="original")."""
+    gt_shape = gt_masks_native.shape[1:]
+
+    ours_combined = np.zeros(gt_shape, dtype=bool)
+    for i in range(ours_masks_1024.shape[0]):
+        ours_combined |= resize_binary_nearest(ours_masks_1024[i], gt_shape).astype(bool)
+
+    medsam_combined = np.zeros(gt_shape, dtype=bool)
+    for i in range(medsam_masks_1024.shape[0]):
+        medsam_combined |= resize_binary_nearest(medsam_masks_1024[i], gt_shape).astype(bool)
+
+    gt_combined = np.any(gt_masks_native.astype(bool), axis=0)
+    green_region = ours_combined & gt_combined
+
+    overlay = np.zeros((*gt_shape, 4))
+    overlay[medsam_combined] = [1.0, 0.0, 0.0, 0.35]
+    overlay[green_region] = [0.0, 1.0, 0.0, 0.55]
+    return overlay
+
+
+def save_diff_panel(image: np.ndarray, ours_masks_1024: np.ndarray, medsam_masks_1024: np.ndarray, gt_masks_native: np.ndarray, out_path: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    h, w = image.shape
+    fig, ax = plt.subplots(figsize=(w / 150, h / 150), dpi=150)
+    ax.imshow(image, cmap="gray", extent=(0, w, h, 0))
+    ax.imshow(colorize_diff(ours_masks_1024, medsam_masks_1024, gt_masks_native), extent=(0, w, h, 0))
+    ax.axis("off")
+    ax.set_position([0, 0, 1, 1])
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+
+
 def save_visualizations(
     medsam_pred_records: list[dict],
     medsam_pred_root: Path,
@@ -722,7 +790,7 @@ def save_visualizations(
     figures_dir = figures_root / split
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[{tag}] ranking done, writing {len(selections) * 3} panels to {figures_dir}")
+    print(f"[{tag}] ranking done, writing {len(selections) * 4} panels to {figures_dir}")
     manifest = []
     for rank, row_idx in selections:
         row = delta_df.iloc[row_idx]
@@ -751,6 +819,24 @@ def save_visualizations(
                 "delta": row["delta"],
                 "path": str(out_path),
             })
+
+        # Fourth panel: green = our mask correct vs GT, red = MedSAM's mask
+        # footprint, unioned across every fragment in the image (not one
+        # fragment at a time like the panels above).
+        diff_out_name = f"best{rank}_{tag}_{sample_name}_ours_vs_medsam_diff.png"
+        diff_out_path = figures_dir / diff_out_name
+        save_diff_panel(image, flowsdf_masks, baseline_masks, gt_masks, diff_out_path)
+        manifest.append({
+            "source": tag,
+            "case": "best",
+            "rank_within_case": rank,
+            "sample_name": sample_name,
+            "method": "ours_vs_medsam_diff",
+            "base_dice": row["base_dice"],
+            "flowsdf_dice": row["flowsdf_dice"],
+            "delta": row["delta"],
+            "path": str(diff_out_path),
+        })
 
     print(f"[{tag}] saved {len(manifest)} panels")
     return manifest
@@ -827,7 +913,9 @@ def main() -> int:
 
     # --- Step 3: gating (needs the full merged dataset) -----------------------
     print("\n=== Step 3: gating threshold ===")
-    gated_df, area_threshold = compute_gating(medsam_pred_records)
+    gated_df, area_threshold = compute_gating(medsam_pred_records, threshold_override=args.gating_threshold)
+    if args.gating_threshold is not None:
+        print(f"--gating-threshold set: skipping the RAM-H1200-relative median, routing on {area_threshold:.1f}px directly")
     gating_dir = REPO_ROOT / "src" / "gating_mechanism"
     gated_csv_path = gating_dir / f"gated_ramh1200_flowsdf_{args.split}_records.csv"
     gated_df.to_csv(gated_csv_path, index=False)
