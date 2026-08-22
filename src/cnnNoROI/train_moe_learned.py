@@ -46,7 +46,7 @@ for _p in (str(SRC_DIR), str(GATING_DIR)):
 from sdf_utils import sdf_channel_from_mask                    # noqa: E402
 from cnnNoROI.cnnMoE import GatedMoE                            # noqa: E402
 from cnnNoROI.losses import boundary_dice_bce_loss, load_balance_loss  # noqa: E402
-from dataset import build_moe_union_dataloader                  # noqa: E402
+from dataset import build_moe_union_dataloader, build_expert_dataloaders  # noqa: E402
 # --------------------------------------------------------------------------
 
 FEAT_SIZE = 64
@@ -205,6 +205,19 @@ def train(args: argparse.Namespace) -> None:
         record_list_out=args.out_dir / "moe_val_fragments.csv",
     )
 
+    # Same val fragments as val_loader above, split by the pre-computed area-
+    # routing "expert" label -- used ONLY to report/select on small-only and
+    # large-only val loss (see --checkpoint-metric), never for training. This
+    # is a monitoring split, not a routing decision: both experts + the gate
+    # still see the full union at train time regardless of this.
+    print("Building group-only val dataloaders (monitoring only, for macro-average checkpoint selection)…")
+    val_expert_loaders = build_expert_dataloaders(
+        split="val",
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        csv_dir=args.data_root,
+    )
+
     if args.dry_run:
         from torch.utils.data import DataLoader, Subset
         train_loader = DataLoader(
@@ -215,19 +228,27 @@ def train(args: argparse.Namespace) -> None:
             Subset(val_loader.dataset, range(min(len(val_loader.dataset), args.batch_size * 2))),
             batch_size=args.batch_size, shuffle=False, num_workers=0,
         )
+        val_expert_loaders = {
+            expert: DataLoader(
+                Subset(loader.dataset, range(min(len(loader.dataset), args.batch_size * 2))),
+                batch_size=args.batch_size, shuffle=False, num_workers=0,
+            )
+            for expert, loader in val_expert_loaders.items()
+        }
 
     model = GatedMoE(c_in=258, gate_hidden=64, gate_noise_eps=args.gate_noise).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
     wb_active = wandb_init(args)
     epochs = 2 if args.dry_run else args.epochs
-    best_val_seg = float("inf")
+    best_score = float("inf")
     epochs_no_improve = 0
 
     log_path = args.out_dir / "train_log.csv"
     log_path.write_text(
         "epoch,train_loss,train_seg,train_balance,train_gate0,train_gate1,"
-        "val_loss,val_seg,val_balance,val_gate0,val_gate1\n"
+        "val_loss,val_seg,val_balance,val_gate0,val_gate1,"
+        "val_seg_small,val_seg_large,val_seg_macro,checkpoint_score\n"
     )
 
     for epoch in range(1, epochs + 1):
@@ -243,12 +264,29 @@ def train(args: argparse.Namespace) -> None:
             args.w_boundary, args.boundary_radius, args.dice_weight, args.lambda_balance,
             desc=f"{tag} val",
         )
+        # Monitoring-only passes over the SAME val fragments, split by group,
+        # so a checkpoint can't hide poor small-fragment quality behind the
+        # large majority's aggregate loss. See --checkpoint-metric.
+        va_small = run_one_epoch(
+            model, val_expert_loaders["expert_small"], device, None,
+            args.w_boundary, args.boundary_radius, args.dice_weight, args.lambda_balance,
+            desc=f"{tag} val[small]",
+        )
+        va_large = run_one_epoch(
+            model, val_expert_loaders["expert_large"], device, None,
+            args.w_boundary, args.boundary_radius, args.dice_weight, args.lambda_balance,
+            desc=f"{tag} val[large]",
+        )
+        val_seg_macro = (va_small["seg"] + va_large["seg"]) / 2.0
+        score = val_seg_macro if args.checkpoint_metric == "macro" else va["seg"]
 
         print(
             f"{tag}  train: loss={tr['loss']:.4f} seg={tr['seg']:.4f} bal={tr['balance']:.4f} "
             f"gate=[{tr['gate_0']:.3f},{tr['gate_1']:.3f}]  |  "
             f"val: loss={va['loss']:.4f} seg={va['seg']:.4f} bal={va['balance']:.4f} "
-            f"gate=[{va['gate_0']:.3f},{va['gate_1']:.3f}]"
+            f"gate=[{va['gate_0']:.3f},{va['gate_1']:.3f}]  |  "
+            f"val_small_seg={va_small['seg']:.4f} val_large_seg={va_large['seg']:.4f} "
+            f"macro={val_seg_macro:.4f}  [selecting on {args.checkpoint_metric}]"
         )
 
         # Collapse warnings — see PLAN_C_TRAIN.md §6.
@@ -262,7 +300,8 @@ def train(args: argparse.Namespace) -> None:
                 f"{epoch},{tr['loss']:.6f},{tr['seg']:.6f},{tr['balance']:.6f},"
                 f"{tr['gate_0']:.6f},{tr['gate_1']:.6f},"
                 f"{va['loss']:.6f},{va['seg']:.6f},{va['balance']:.6f},"
-                f"{va['gate_0']:.6f},{va['gate_1']:.6f}\n"
+                f"{va['gate_0']:.6f},{va['gate_1']:.6f},"
+                f"{va_small['seg']:.6f},{va_large['seg']:.6f},{val_seg_macro:.6f},{score:.6f}\n"
             )
 
         wandb_log(
@@ -271,13 +310,15 @@ def train(args: argparse.Namespace) -> None:
                 "train/gate_mass_expert_0": tr["gate_0"], "train/gate_mass_expert_1": tr["gate_1"],
                 "val/loss": va["loss"], "val/seg": va["seg"], "val/balance": va["balance"],
                 "val/gate_mass_expert_0": va["gate_0"], "val/gate_mass_expert_1": va["gate_1"],
+                "val/seg_small": va_small["seg"], "val/seg_large": va_large["seg"],
+                "val/seg_macro": val_seg_macro, "val/checkpoint_score": score,
             },
             step=epoch,
             active=wb_active,
         )
 
-        if va["seg"] < best_val_seg:
-            best_val_seg = va["seg"]
+        if score < best_score:
+            best_score = score
             epochs_no_improve = 0
             ckpt = args.out_dir / "best.pth"
             torch.save({
@@ -285,17 +326,22 @@ def train(args: argparse.Namespace) -> None:
                 "gate_state":     model.gate.state_dict(),
                 "expert_0_state": model.expert_0.state_dict(),
                 "expert_1_state": model.expert_1.state_dict(),
-                "val_seg_loss":   va["seg"],
+                "checkpoint_metric": args.checkpoint_metric,
+                "checkpoint_score":  score,
+                "val_seg_pooled": va["seg"],
+                "val_seg_small":  va_small["seg"],
+                "val_seg_large":  va_large["seg"],
+                "val_seg_macro":  val_seg_macro,
                 "val_gate_mass":  [va["gate_0"], va["gate_1"]],
                 "config":         vars(args),
             }, ckpt)
-            print(f"  -> best checkpoint (val_seg={best_val_seg:.4f}): {ckpt}")
+            print(f"  -> best checkpoint ({args.checkpoint_metric}={best_score:.4f}): {ckpt}")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= args.patience:
                 print(f"[moe-learned] early stopping at epoch {epoch} "
-                      f"(no val_seg improvement for {args.patience} epochs, "
-                      f"best_val_seg={best_val_seg:.4f})")
+                      f"(no {args.checkpoint_metric} improvement for {args.patience} epochs, "
+                      f"best={best_score:.4f})")
                 break
 
     wandb_finish(wb_active)
@@ -306,7 +352,15 @@ def train(args: argparse.Namespace) -> None:
         "Keys:\n"
         "- `gate_state`: state_dict for cnnMoE.Gate(c_in=258, hidden=64, n_experts=2)\n"
         "- `expert_0_state`, `expert_1_state`: state_dicts for cnnMoE.CNNExpert(c_in=258)\n"
-        "- `val_seg_loss`: best validation segmentation loss (L_DSC/BCE blend, no balance term)\n"
+        "- `checkpoint_metric`: 'pooled' or 'macro' -- which score gated selection for THIS checkpoint "
+        "(see --checkpoint-metric; also in config.json)\n"
+        "- `checkpoint_score`: the value of checkpoint_metric that made this the best epoch so far\n"
+        "- `val_seg_pooled`: aggregate val_seg over the natural ~8%/92% small/large union val set "
+        "(large-majority-dominated)\n"
+        "- `val_seg_small`, `val_seg_large`: val_seg computed on the SAME val fragments, split by the "
+        "pre-computed area-routing label (monitoring only, not used for training/routing)\n"
+        "- `val_seg_macro`: (val_seg_small + val_seg_large) / 2 -- equal weight per group regardless of "
+        "how many fragments are in each\n"
         "- `val_gate_mass`: [mean gate weight expert_0, mean gate weight expert_1] on val at that epoch\n"
         "- `config`: full run config (see also config.json in this directory)\n\n"
         "Load with:\n"
@@ -325,7 +379,7 @@ def train(args: argparse.Namespace) -> None:
         "with expert_large stratified-subsampled per `--keep-large-subsample` for budget parity "
         "with the rule-based-gate baseline. No area-threshold routing is applied to this data.\n"
     )
-    print(f"[moe-learned] done. Best val_seg={best_val_seg:.4f}. Checkpoint dir: {args.out_dir}")
+    print(f"[moe-learned] done. Best {args.checkpoint_metric}={best_score:.4f}. Checkpoint dir: {args.out_dir}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -357,6 +411,15 @@ def parse_args() -> argparse.Namespace:
                              "same fragment budget as the paper's rule-based gate. false: use all "
                              "expert_large fragments unsubsampled.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpoint-metric", choices=["pooled", "macro"], default="pooled",
+                        help="pooled (default): select best.pth on aggregate val_seg over the natural "
+                             "~8%%/92%% small/large union val set -- matches the original run's behaviour "
+                             "exactly, dominated by the large-fragment majority. macro: select on "
+                             "(val_seg_small + val_seg_large) / 2, computed from the SAME full val set "
+                             "split by group and averaged with equal weight regardless of group size -- "
+                             "protects against a checkpoint that's only good on the large majority. Both "
+                             "metrics are always logged/reported regardless of which one gates selection, "
+                             "so a run's config.json fully determines which was used for reproducibility.")
     parser.add_argument("--dry-run", action="store_true",
                         help="1-2 epochs on a small subset to sanity-check the loop before a full run.")
     # W&B

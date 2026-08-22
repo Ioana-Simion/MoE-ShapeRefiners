@@ -2,21 +2,34 @@
 
 #SBATCH --partition=gpu_mig
 #SBATCH --gpus=1
-#SBATCH --job-name=train_moe_learned_cnnNoROI
+#SBATCH --job-name=train_moe_learned_cnnNoROI_macro
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --time=08:00:00
-#SBATCH --output=/home/isimion/MoE-ShapeRefiners/src/cnnNoROI/slurm_train_moe_learned_%A.out
+#SBATCH --output=/home/isimion/MoE-ShapeRefiners/src/cnnNoROI/slurm_train_moe_learned_macro_%A.out
 
-# Learned soft-gate MoE (PLAN_C_TRAIN): jointly trains a gate + two fresh
-# cnnNoROI experts on one segmentation loss, letting size specialisation
-# emerge instead of imposing the fixed area-threshold routing.
+# Same learned soft-gate MoE as 1_train_moe_learned_cnnnoroi.job, but selects
+# best.pth on --checkpoint-metric macro instead of the default pooled.
 #
-# gpu_mig: single 1g.10gb A100 slice is ample — model is small (two
-# CNNExperts + a tiny gate MLP), same footprint as the rule-based experts.
-# cpus-per-task=9: 8 DataLoader workers + 1 main process.
-# (gpu_mig may not exist as a partition name on this cluster -- check
-# `sinfo` and adjust #SBATCH --partition above if needed.)
+# Why a separate job instead of overwriting run 1's config: run 1
+# (checkpoint_metric=pooled) selects best.pth on aggregate val_seg over the
+# natural ~8%/92% small/large val union, which is dominated by the large
+# majority -- a checkpoint could be mediocre on small fragments and still
+# "win" there. This run instead selects on (val_seg_small + val_seg_large)/2,
+# computed from the SAME val set split by group and weighted equally
+# regardless of group size -- so small-fragment quality can't be hidden
+# behind the large majority's aggregate loss. See train_moe_learned.py's
+# --checkpoint-metric docstring, and PLAN_C_TRAIN.md.
+#
+# Both metrics are logged every epoch by BOTH jobs regardless of which one
+# gates selection (train_log.csv columns val_seg, val_seg_small,
+# val_seg_large, val_seg_macro) -- this job only changes which one decides
+# best.pth. Kept as a distinct job/out-dir (not a flag toggled on job 1) so
+# both runs' checkpoints, logs, and config.json remain independently
+# reproducible and comparable side by side.
+#
+# gpu_mig may not exist as a partition name on this cluster -- check `sinfo`
+# and adjust #SBATCH --partition above if needed.
 #
 # Requires regenerate_medsam_for_moe_learned.job to have completed first
 # (data/medsam-predictions/ + repathed gated_{split}_records.csv).
@@ -51,7 +64,7 @@ echo "gpu     : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo "python  : $(which python)"
 echo "========================================"
 
-OUT_DIR="checkpoints/cnnNoROI_moe_learned/run_${SLURM_JOB_ID}"
+OUT_DIR="checkpoints/cnnNoROI_moe_learned_macro/run_${SLURM_JOB_ID}"
 
 python src/cnnNoROI/train_moe_learned.py \
     --out-dir "${OUT_DIR}" \
@@ -66,7 +79,7 @@ python src/cnnNoROI/train_moe_learned.py \
     --large-subsample 17000 \
     --keep-large-subsample true \
     --seed 42 \
-    --checkpoint-metric pooled \
+    --checkpoint-metric macro \
     --wandb-project moe-shaprefine
 
 echo "========================================"
