@@ -44,3 +44,5 @@ src/gating_mechanism/gating_ablation/strategy3_seed42/predictions/binary_masks/
 src/gating_mechanism/gating_ablation/strategy3_seed123/predictions/binary_masks/
 src/gating_mechanism/gating_ablation/strategy4_learned_cnnnoroi/predictions/binary_masks/
 data_distribution_results/data_analysis_medsam/medsam_features_checkpoint.jsonl
+RAM-H1200-v1_dataset
+figures
