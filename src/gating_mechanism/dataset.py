@@ -1,3 +1,4 @@
+import os
 import sys
 import numpy as np
 import torch
@@ -11,7 +12,14 @@ from dataloader_utils import load_pengwin_label, decode_pengwin_fragment_from_re
 from paths import TOPLEVEL_DATA_ROOT
 
 CSV_DIR = Path(__file__).parent
-GT_DIR  = TOPLEVEL_DATA_ROOT / "pengwin" / "original" / "task2_xray" / "train" / "output" / "images" / "x-ray"
+# MOE_GT_LABEL_ROOT lets a cluster with a differently-laid-out raw PENGWIN
+# dataset (e.g. missing the "original/task2_xray" wrapper this repo assumes
+# under TOPLEVEL_DATA_ROOT) point GT loading directly at the real label
+# directory, without needing a symlink to fake the expected layout.
+GT_DIR = Path(os.environ.get(
+    "MOE_GT_LABEL_ROOT",
+    str(TOPLEVEL_DATA_ROOT / "pengwin" / "original" / "task2_xray" / "train" / "output" / "images" / "x-ray"),
+))
 
 
 class FragmentDataset(Dataset):

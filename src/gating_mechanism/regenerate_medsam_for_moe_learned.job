@@ -22,8 +22,8 @@
 #               run_medsam_with_pengwin_boxes.py's built-in default, no override needed)
 #   dataset   : /home/isimion/datasets/pengwin/train/{input,output}/images/x-ray
 #               -- note this is missing the repo's expected "original/task2_xray"
-#               wrapper layer under pengwin/, so a plain root-swap env var can't
-#               fix it alone; see the one-time symlink setup below.
+#               wrapper layer under pengwin/; MOE_GT_LABEL_ROOT below points
+#               dataset.py's GT loading straight at the real label dir instead.
 #
 # Prerequisites on THIS cluster before running:
 #   0. No separate "preprocessing" script needed -- normalization (neglog +
@@ -41,14 +41,11 @@
 #      NOT needed anywhere in this job: that file is only consumed inside
 #      gating_mechanism.py's from-scratch CSV-generation path (SPLITS_DIR), which
 #      never runs here since the CSVs already exist.
-#   4. ONE-TIME symlink so dataset.py's GT-loading (GT_DIR, used by every
-#      training script) resolves through MOE_DATA_ROOT below onto the real
-#      dataset, despite the missing "original/task2_xray" layer:
-#        mkdir -p /home/isimion/datasets/pengwin/original/task2_xray
-#        ln -s /home/isimion/datasets/pengwin/train \
-#              /home/isimion/datasets/pengwin/original/task2_xray/train
-#      This makes .../pengwin/original/task2_xray/train/{input,output}/images/x-ray
-#      resolve to the real .../pengwin/train/{input,output}/images/x-ray.
+#   4. MOE_GT_LABEL_ROOT env var (set below) points dataset.py's GT-loading
+#      (GT_DIR, used by every training script) directly at the real label
+#      directory -- no symlink needed, since dataset.py now reads this env
+#      var directly instead of assuming the "original/task2_xray" wrapper
+#      layer this cluster's dataset doesn't have.
 #
 # Steps:
 #   1. extract_case_ids.py       -> case_ids_all_splits.txt (union of train/val/test)
@@ -95,6 +92,7 @@ conda activate MoE
 
 export MOE_PROJECT_ROOT=/home/isimion/MoE-ShapeRefiners
 export MOE_DATA_ROOT=/home/isimion/datasets
+export MOE_GT_LABEL_ROOT=/home/isimion/datasets/pengwin/train/output/images/x-ray
 
 cd "${MOE_PROJECT_ROOT}"
 
