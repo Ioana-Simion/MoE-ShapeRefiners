@@ -63,6 +63,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-boundary", action="store_true",
                         help="Compute only Dice and IoU (much faster).")
+    parser.add_argument(
+        "--area-threshold", type=float, default=None,
+        help="Passed through to evaluate_medsam_pengwin.py's --area-threshold. Pin this to the "
+             "SAME value across every model being compared (see PLAN_C_EVAL §6) -- without it, "
+             "evaluate_medsam_pengwin.py defaults to the median bbox area of whatever it evaluated, "
+             "which drifts between runs/subsets and makes 'by size' rows non-comparable.",
+    )
     parser.add_argument("--delta", action="store_true",
                         help="After evaluation, compute delta CSV vs --medsam-csv.")
     parser.add_argument("--delta-only", action="store_true",
@@ -117,6 +124,8 @@ def run_evaluator(args: argparse.Namespace) -> None:
             cmd.append("--skip-boundary")
         if args.limit is not None:
             cmd += ["--limit", str(args.limit)]
+        if args.area_threshold is not None:
+            cmd += ["--area-threshold", str(args.area_threshold)]
 
         print("Running:", " ".join(cmd))
         subprocess.run(cmd, check=True)

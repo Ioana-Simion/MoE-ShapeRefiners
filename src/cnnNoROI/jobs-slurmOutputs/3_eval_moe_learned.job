@@ -1,0 +1,109 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_mig
+#SBATCH --gpus=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --time=04:00:00
+#SBATCH --job-name=eval_moe_learned
+#SBATCH --output=/home/isimion/MoE-ShapeRefiners/src/cnnNoROI/slurm_eval_moe_learned_%A.out
+
+# Evaluates the learned soft-gate MoE checkpoint on the test split: hard
+# (argmax) + soft (blend) inference, overall/per-class/per-size metrics for
+# each mode, and the post-hoc gate analysis (does the learned routing
+# correlate with size/shape/anatomy?). Does NOT pull in the other models'
+# numbers -- you already have those; only re-run their evals if this job's
+# AREA_THRESHOLD note below means your existing numbers aren't comparable.
+#
+# REQUIRED: set CHECKPOINT below to the best.pth from a completed
+# train_moe_learned.py run (job 1 or job 2).
+#
+# AREA_THRESHOLD is pinned to 146285.71166992188 so the "by size" breakdown
+# here is comparable to your existing numbers -- this is the value the most
+# recent rule-based cnnNoROI eval (slurm_evaluate_moe_24425093.out) and the
+# Appendix-B random-routing baseline (gating_ablation/strategy3_seed42) both
+# already used. Older baseline runs (e.g.
+# slurm_evaluate_medsam_baseline_24411642.out) used a slightly different value
+# (146463.35) because evaluate_medsam_pengwin.py defaults to the median bbox
+# area of whatever it evaluates when --area-threshold isn't passed explicitly
+# -- if the numbers you're comparing against came from one of those older
+# runs, the small/large split won't line up exactly with this job's output.
+
+set -euo pipefail
+
+CHECKPOINT="checkpoints/cnnNoROI_moe_learned/run_REPLACE_ME/best.pth"
+AREA_THRESHOLD=146285.71166992188
+
+# --- module/conda setup: ADJUST FOR THIS CLUSTER ---------------------------
+module purge
+module load 2024
+module load Anaconda3/2024.06-1
+source /sw/arch/RHEL9/EB_production/2024/software/Anaconda3/2024.06-1/etc/profile.d/conda.sh
+conda activate MoE
+# -----------------------------------------------------------------------------
+
+export MOE_PROJECT_ROOT=/home/isimion/MoE-ShapeRefiners
+export MOE_DATA_ROOT=/home/isimion/datasets
+export MOE_GT_LABEL_ROOT=/home/isimion/datasets/pengwin/train/output/images/x-ray
+
+cd "${MOE_PROJECT_ROOT}"
+
+if [[ "${CHECKPOINT}" == *REPLACE_ME* ]]; then
+    echo "ERROR: edit CHECKPOINT at the top of this job to point at a real best.pth" >&2
+    exit 1
+fi
+
+echo "========================================"
+echo "job id     : ${SLURM_JOB_ID}"
+echo "checkpoint : ${CHECKPOINT}"
+echo "start      : $(date)"
+echo "========================================"
+
+OUT_ROOT="data/moe-learned-predictions"
+
+echo ""
+echo "--- Step 1: hard + soft inference on test split ---"
+python src/cnnNoROI/infer_moe_learned.py \
+    --checkpoint "${CHECKPOINT}" \
+    --split test \
+    --output-root "${OUT_ROOT}"
+
+echo ""
+echo "--- Step 2a: evaluate hard-mode predictions ---"
+python evaluation/evaluate_moe_pengwin.py \
+    --pred-mask-root "${OUT_ROOT}/hard/binary_masks" \
+    --output-csv     "${OUT_ROOT}/evaluation_hard.csv" \
+    --area-threshold "${AREA_THRESHOLD}" \
+    --num-workers 8
+
+echo ""
+echo "--- Step 2b: evaluate soft-mode predictions ---"
+python evaluation/evaluate_moe_pengwin.py \
+    --pred-mask-root "${OUT_ROOT}/soft/binary_masks" \
+    --output-csv     "${OUT_ROOT}/evaluation_soft.csv" \
+    --area-threshold "${AREA_THRESHOLD}" \
+    --num-workers 8
+
+echo ""
+echo "--- Step 3: summarize hard + soft results (overall / per-class / per-size) ---"
+# Same summarizer used for every other model in this repo (evaluate_moe.py,
+# evaluate_medsam_baseline.job, ...) -- prints + saves overall, per-class
+# (SA/LI/RI), and per-size (small/large) mean Dice/IoU/HD95/ASSD, in the same
+# format as the numbers you already have for the other models, so they're
+# directly eyeball-comparable without pulling those other CSVs into this job.
+python evaluation/summarize_eval_csv.py "${OUT_ROOT}/evaluation_hard.csv" \
+    --summary-csv "${OUT_ROOT}/evaluation_hard_summary.csv"
+
+python evaluation/summarize_eval_csv.py "${OUT_ROOT}/evaluation_soft.csv" \
+    --summary-csv "${OUT_ROOT}/evaluation_soft_summary.csv"
+
+echo ""
+echo "--- Step 4: post-hoc gate analysis (§3) ---"
+python evaluation/gate_analysis.py \
+    --gate-weights "${OUT_ROOT}/gate_weights_test.csv" \
+    --eval-csv     "${OUT_ROOT}/evaluation_hard.csv" \
+    --output-dir   "${OUT_ROOT}/gate_analysis"
+
+echo "========================================"
+echo "end : $(date)"
+echo "========================================"
