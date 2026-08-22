@@ -63,7 +63,12 @@ OUTPUT_SIZE = 1024
 
 def load_gated_moe(checkpoint_path: Path, device: torch.device) -> GatedMoE:
     model = GatedMoE(c_in=258, gate_hidden=64, gate_noise_eps=0.0).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    # weights_only=False: this checkpoint's "config" dict (see train_moe_learned.py)
+    # contains pathlib.Path objects from argparse (e.g. --out-dir), which aren't on
+    # torch's weights_only=True safe-globals allowlist (PyTorch >=2.6 default).
+    # Safe here since this is our own checkpoint produced by train_moe_learned.py,
+    # not a downloaded/untrusted file.
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.gate.load_state_dict(ckpt["gate_state"])
     model.expert_0.load_state_dict(ckpt["expert_0_state"])
     model.expert_1.load_state_dict(ckpt["expert_1_state"])

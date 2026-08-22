@@ -179,7 +179,14 @@ def train(args: argparse.Namespace) -> None:
     print(f"device: {device}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    (args.out_dir / "config.json").write_text(json.dumps(vars(args), indent=2, default=str))
+    # JSON round-trip (not vars(args) directly) so every value is a plain str/int/
+    # float/bool -- Path objects survive an unqualified torch.save fine, but
+    # torch.load(weights_only=True) (default since PyTorch 2.6) rejects them, since
+    # pathlib.Path isn't on its safe-globals allowlist. Keeping checkpoints
+    # weights_only=True-loadable avoids forcing weights_only=False (and its
+    # associated trust warning) on every future inference script.
+    config_dict = json.loads(json.dumps(vars(args), default=str))
+    (args.out_dir / "config.json").write_text(json.dumps(config_dict, indent=2))
 
     large_subsample = args.large_subsample if args.keep_large_subsample else None
     if args.dry_run:
@@ -333,7 +340,7 @@ def train(args: argparse.Namespace) -> None:
                 "val_seg_large":  va_large["seg"],
                 "val_seg_macro":  val_seg_macro,
                 "val_gate_mass":  [va["gate_0"], va["gate_1"]],
-                "config":         vars(args),
+                "config":         config_dict,
             }, ckpt)
             print(f"  -> best checkpoint ({args.checkpoint_metric}={best_score:.4f}): {ckpt}")
         else:
