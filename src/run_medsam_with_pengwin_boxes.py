@@ -93,6 +93,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional limit for a smaller smoke test.",
     )
     parser.add_argument(
+        "--case-ids-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional text file with one case_id per line (e.g. produced by "
+            "gating_mechanism/extract_case_ids.py). Restricts inference to "
+            "exactly these cases, so regenerated embeddings/masks cover the "
+            "same fragments as an existing gated_{split}_records.csv."
+        ),
+    )
+    parser.add_argument(
         "--finetuned-ckpt",
         type=Path,
         default=None,
@@ -120,8 +131,16 @@ def load_records(
     case_id: str | None,
     sample_name: str | None,
     limit: int | None,
+    case_ids_file: Path | None = None,
 ) -> list[dict]:
+    wanted_case_ids: set[str] | None = None
+    if case_ids_file is not None:
+        wanted_case_ids = {
+            line.strip() for line in case_ids_file.read_text().splitlines() if line.strip()
+        }
+
     records: list[dict] = []
+    seen_case_ids: set[str] = set()
     with metadata_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -132,9 +151,22 @@ def load_records(
                 continue
             if sample_name is not None and record.get("sample_name") != sample_name:
                 continue
+            if wanted_case_ids is not None and record.get("case_id") not in wanted_case_ids:
+                continue
             records.append(record)
+            seen_case_ids.add(record.get("case_id"))
             if limit is not None and len(records) >= limit:
                 break
+
+    if wanted_case_ids is not None:
+        missing = wanted_case_ids - seen_case_ids
+        if missing and limit is None:
+            raise FileNotFoundError(
+                f"{len(missing)} case_ids from {case_ids_file} have no matching record in "
+                f"{metadata_path}. Example: {sorted(missing)[:5]} — did you run "
+                "prepare_pengwin_xray_boxes_for_medsam_inference.py --case-ids-file first?"
+            )
+
     return records
 
 
@@ -285,6 +317,7 @@ def main() -> int:
         case_id=args.case_id,
         sample_name=args.sample_name,
         limit=args.limit,
+        case_ids_file=args.case_ids_file,
     )
 
     if not records:

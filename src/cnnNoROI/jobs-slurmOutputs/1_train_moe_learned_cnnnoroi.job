@@ -1,0 +1,57 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_mig
+#SBATCH --gpus=1
+#SBATCH --job-name=train_moe_learned_cnnNoROI
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --time=08:00:00
+#SBATCH --output=/gpfs/home5/aramautar2/projects/MoE-ShapeRefine-MedicalSeg/src/cnnNoROI/slurm_train_moe_learned_%A.out
+
+# Learned soft-gate MoE (PLAN_C_TRAIN): jointly trains a gate + two fresh
+# cnnNoROI experts on one segmentation loss, letting size specialisation
+# emerge instead of imposing the fixed area-threshold routing.
+#
+# gpu_mig: single 1g.10gb A100 slice is ample — model is small (two
+# CNNExperts + a tiny gate MLP), same footprint as the rule-based experts.
+# cpus-per-task=9: 8 DataLoader workers + 1 main process.
+
+set -euo pipefail
+
+module purge
+module load 2024
+module load Anaconda3/2024.06-1
+
+source /sw/arch/RHEL9/EB_production/2024/software/Anaconda3/2024.06-1/etc/profile.d/conda.sh
+conda activate MoE
+
+cd /gpfs/home5/aramautar2/projects/MoE-ShapeRefine-MedicalSeg
+
+echo "========================================"
+echo "job id  : ${SLURM_JOB_ID}"
+echo "host    : $(hostname)"
+echo "start   : $(date)"
+echo "gpu     : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'n/a')"
+echo "python  : $(which python)"
+echo "========================================"
+
+OUT_DIR="checkpoints/cnnNoROI_moe_learned/run_${SLURM_JOB_ID}"
+
+python src/cnnNoROI/train_moe_learned.py \
+    --out-dir "${OUT_DIR}" \
+    --epochs 40 \
+    --patience 10 \
+    --batch-size 64 \
+    --num-workers 8 \
+    --lr 1e-4 \
+    --wd 1e-4 \
+    --lambda-balance 0.1 \
+    --gate-noise 0.3 \
+    --large-subsample 17000 \
+    --keep-large-subsample true \
+    --seed 42 \
+    --wandb-project moe-shaprefine
+
+echo "========================================"
+echo "end : $(date)"
+echo "========================================"

@@ -79,6 +79,18 @@ def parse_args() -> argparse.Namespace:
         help="Process only the first N cases (for debugging).",
     )
     parser.add_argument(
+        "--case-ids-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional text file with one case_id per line (e.g. produced by "
+            "gating_mechanism/extract_case_ids.py). Restricts processing to "
+            "exactly these cases, so a regenerated dataset covers the same "
+            "fragments as an existing gated_{split}_records.csv without "
+            "reprocessing the full PENGWIN corpus."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Skip cases already present in metadata.jsonl.",
@@ -253,6 +265,21 @@ def main() -> int:
     metadata_path = args.output_root / "metadata.jsonl"
 
     case_ids = iter_case_ids(args.image_root, args.label_root)
+
+    if args.case_ids_file is not None:
+        wanted = {
+            line.strip() for line in args.case_ids_file.read_text().splitlines() if line.strip()
+        }
+        missing = wanted - set(case_ids)
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing)} case_ids from {args.case_ids_file} have no matching "
+                f"image+label pair under --image-root/--label-root. Example: {sorted(missing)[:5]}"
+            )
+        case_ids = sorted(wanted)
+        if args.verbose:
+            print(f"--case-ids-file: restricting to {len(case_ids)} cases from {args.case_ids_file}")
+
     if args.limit is not None:
         case_ids = case_ids[: args.limit]
 

@@ -99,3 +99,71 @@ def build_expert_dataloaders(
         )
 
     return loaders
+
+
+def build_moe_union_dataloader(
+    split: str = "train",
+    batch_size: int = 8,
+    num_workers: int = 4,
+    large_subsample: int | None = None,
+    csv_dir: Path | None = None,
+    seed: int = 42,
+    record_list_out: Path | None = None,
+):
+    """Load gated_{split}_records.csv and return ONE DataLoader over the union
+    of expert_small + expert_large fragments — for jointly-trained soft-gate
+    MoE, where both experts (and the gate) must see every fragment rather than
+    a pre-routed subset.
+
+    The pre-computed "expert" column (area-threshold routing) is used ONLY to
+    reproduce the existing expert_large subsampling for training-budget parity
+    with the rule-based-gate baseline — it does NOT restrict which fragments a
+    given expert or the gate sees at train time.
+
+    Args:
+        large_subsample: if set, subsample expert_large to this many fragments
+            (stratified by SA/LI/RI) before unioning with expert_small, same
+            as build_expert_dataloaders. Recommended for a first run so the
+            joint MoE trains on the same fragment budget as the paper's
+            rule-based gate.
+        record_list_out: if set, write the exact fragment list used (case_id,
+            sample_name, medsam_instance_id, fragment_id, area) to this CSV —
+            for provenance / to confirm the gate saw an unbiased union.
+    """
+    csv_dir  = csv_dir or CSV_DIR
+    csv_path = csv_dir / f"gated_{split}_records.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"{csv_path} not found. Run `python gating_mechanism.py` first."
+        )
+
+    df      = pd.read_csv(csv_path)
+    shuffle = split == "train"
+
+    small_df = df[df.expert == "expert_small"]
+    large_df = df[df.expert == "expert_large"]
+
+    if large_subsample is not None:
+        n = min(large_subsample, len(large_df))
+        large_records = stratified_subsample(large_df, n=n, seed=seed)
+    else:
+        large_records = large_df.to_dict("records")
+
+    records = small_df.to_dict("records") + large_records
+    print(f"[{split}] moe union: {len(small_df)} small + {len(large_records)} large "
+          f"= {len(records)} fragments (both experts + gate see all of these)")
+
+    if record_list_out is not None:
+        record_list_out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(records)[
+            ["case_id", "sample_name", "medsam_instance_id", "fragment_id", "area"]
+        ].to_csv(record_list_out, index=False)
+        print(f"[{split}] fragment list saved: {record_list_out}")
+
+    return DataLoader(
+        FragmentDataset(records),
+        batch_size=batch_size,
+        shuffle=shuffle and len(records) > 0,
+        num_workers=num_workers,
+        pin_memory=True,
+    )

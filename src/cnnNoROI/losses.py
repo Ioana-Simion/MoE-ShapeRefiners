@@ -87,3 +87,21 @@ def boundary_dice_bce_loss(
     l_dice = dice_loss(pred, gt).mean()
     l_bce  = boundary_weighted_bce(pred, gt, w_boundary, boundary_radius)
     return dice_weight * l_dice + (1.0 - dice_weight) * l_bce
+
+
+def load_balance_loss(gate_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Shazeer-style importance/load-balancing loss for a soft MoE gate.
+
+    Penalises the gate for concentrating mass on one expert across the batch,
+    which keeps both experts alive under fresh initialisation.
+
+    Args:
+        gate_weights: (B, n_experts) softmax gate weights (post-noise at train
+            time). Values in [0, 1], rows sum to 1.
+        eps: numerical stabiliser for the mean in the denominator.
+
+    Returns:
+        Scalar CV(importance)^2, where importance = gate_weights.sum(dim=0).
+    """
+    importance = gate_weights.sum(dim=0)  # (n_experts,)
+    return (importance.std() / (importance.mean() + eps)) ** 2

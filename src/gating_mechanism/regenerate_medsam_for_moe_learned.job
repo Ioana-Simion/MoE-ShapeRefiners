@@ -1,0 +1,140 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --job-name=regen_medsam_moe_learned
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --time=06:00:00
+#SBATCH --output=/home/isimion/MoE-ShapeRefiners/src/gating_mechanism/slurm_regen_medsam_%A.out
+
+# Regenerates MedSAM embeddings + binary masks on THIS cluster, restricted to
+# exactly the case_ids referenced by the existing gated_train/val/test_records.csv
+# (produced on the old cluster). This exists because copying the derived
+# .npy/.npz embedding+mask files across clusters was judged too irresponsible
+# -- so they're recomputed from the original PENGWIN images+labels instead,
+# for only the cases actually used, rather than the full corpus.
+#
+# CLUSTER-SPECIFIC LAYOUT (this cluster differs from the repo's assumed
+# ~/projects/<repo> / ~/projects/data convention -- see paths.py):
+#   repo root : /home/isimion/MoE-ShapeRefiners
+#   MedSAM    : /home/isimion/MedSAM                              (sibling -- matches
+#               run_medsam_with_pengwin_boxes.py's built-in default, no override needed)
+#   dataset   : /home/isimion/datasets/pengwin/train/{input,output}/images/x-ray
+#               -- note this is missing the repo's expected "original/task2_xray"
+#               wrapper layer under pengwin/, so a plain root-swap env var can't
+#               fix it alone; see the one-time symlink setup below.
+#
+# Prerequisites on THIS cluster before running:
+#   0. No separate "preprocessing" script needed -- normalization (neglog +
+#      percentile windowing + uint8 + resize) happens on the fly, per image,
+#      inside run_medsam_with_pengwin_boxes.py's load_and_preprocess_image().
+#      Nothing writes a cached preprocessed copy of the dataset; every run
+#      reads the raw .tif and re-normalizes it.
+#   1. Raw PENGWIN data present at /home/isimion/datasets/pengwin/train/... .
+#   2. MedSAM checkpoint present at /home/isimion/MedSAM/work_dir/MedSAM/medsam_vit_b.pth
+#      (run fix_checkpoint.py first if using the base MedSAM checkpoint, per
+#      the main README's Environment Setup section).
+#   3. gated_{train,val,test}_records.csv already present in src/gating_mechanism/
+#      on this cluster -- confirmed, nothing to copy for this. extract_case_ids.py
+#      (step 1 below) reads directly from these, so pengwin/splits/{split}.csv is
+#      NOT needed anywhere in this job: that file is only consumed inside
+#      gating_mechanism.py's from-scratch CSV-generation path (SPLITS_DIR), which
+#      never runs here since the CSVs already exist.
+#   4. ONE-TIME symlink so dataset.py's GT-loading (GT_DIR, used by every
+#      training script) resolves through MOE_DATA_ROOT below onto the real
+#      dataset, despite the missing "original/task2_xray" layer:
+#        mkdir -p /home/isimion/datasets/pengwin/original/task2_xray
+#        ln -s /home/isimion/datasets/pengwin/train \
+#              /home/isimion/datasets/pengwin/original/task2_xray/train
+#      This makes .../pengwin/original/task2_xray/train/{input,output}/images/x-ray
+#      resolve to the real .../pengwin/train/{input,output}/images/x-ray.
+#
+# Steps:
+#   1. extract_case_ids.py       -> case_ids_all_splits.txt (union of train/val/test)
+#   2. prepare_pengwin_xray_boxes_for_medsam_inference.py --case-ids-file
+#        -> data/bounding-boxes-xrays/{boxes,metadata.jsonl}  (only these cases)
+#   3. run_medsam_with_pengwin_boxes.py --case-ids-file
+#        -> data/medsam-predictions/{embeddings,binary_masks,metadata.jsonl}
+#   4. repath_gated_csvs.py
+#        -> rewrites embedding_path/binary_masks_path in the EXISTING
+#           gated_{train,val,test}_records.csv to point at this cluster's
+#           freshly-generated files (step 3's output), joined on sample_name.
+#           This does NOT re-route fragments or touch split membership -- the
+#           existing CSVs (already present on this cluster) are the source of
+#           truth for which fragments are in each split and which expert they
+#           route to; only the two stale path columns change. A backup of each
+#           original CSV is written alongside it (*.csv.prerepath.bak) before
+#           any rewrite.
+#
+# Step 4 exists because those CSVs' path columns point at the OLD cluster's
+# account (e.g. /gpfs/home5/aramautar2/...) -- resolve_existing_path() in
+# dataloader_utils.py only bridges /gpfs/home5 vs /home path-PREFIX variants
+# on the SAME account, it cannot resolve a different account/host, so those
+# columns are guaranteed stale here, not just possibly stale.
+#
+# Steps 2 and 3 are given explicit paths below rather than relying on script
+# defaults -- prepare_pengwin_xray_boxes_for_medsam_inference.py in particular
+# falls back to $SLURM_SUBMIT_DIR (wherever `sbatch` was invoked from) if set,
+# which would silently rebase everything under this job's submission
+# directory if it isn't explicitly overridden.
+
+set -euo pipefail
+
+# --- module/conda setup: ADJUST FOR THIS CLUSTER ---------------------------
+# The lines below are Snellius-specific (module system + Anaconda module path)
+# and almost certainly don't apply as-is here -- replace with however this
+# cluster provisions the `MoE` conda env (or just `conda activate MoE` if
+# conda is already on PATH).
+module purge
+module load 2024
+module load Anaconda3/2024.06-1
+source /sw/arch/RHEL9/EB_production/2024/software/Anaconda3/2024.06-1/etc/profile.d/conda.sh
+conda activate MoE
+# -----------------------------------------------------------------------------
+
+export MOE_PROJECT_ROOT=/home/isimion/MoE-ShapeRefiners
+export MOE_DATA_ROOT=/home/isimion/datasets
+
+cd "${MOE_PROJECT_ROOT}"
+
+DATASET_IMAGE_ROOT=/home/isimion/datasets/pengwin/train/input/images/x-ray
+DATASET_LABEL_ROOT=/home/isimion/datasets/pengwin/train/output/images/x-ray
+
+echo "========================================"
+echo "job id  : ${SLURM_JOB_ID}"
+echo "host    : $(hostname)"
+echo "start   : $(date)"
+echo "gpu     : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'n/a')"
+echo "========================================"
+
+echo ""
+echo "--- Step 1: extract case_ids used by the existing gated_{split}_records.csv ---"
+python src/gating_mechanism/extract_case_ids.py \
+    --out src/gating_mechanism/case_ids_all_splits.txt
+
+echo ""
+echo "--- Step 2: extract boxes for exactly those cases ---"
+python src/prepare_pengwin_xray_boxes_for_medsam_inference.py \
+    --image-root "${DATASET_IMAGE_ROOT}" \
+    --label-root "${DATASET_LABEL_ROOT}" \
+    --case-ids-file src/gating_mechanism/case_ids_all_splits.txt \
+    --resume \
+    --verbose
+
+echo ""
+echo "--- Step 3: run MedSAM inference for exactly those cases ---"
+python src/run_medsam_with_pengwin_boxes.py \
+    --output-root data/medsam-predictions \
+    --case-ids-file src/gating_mechanism/case_ids_all_splits.txt \
+    --resume
+
+echo ""
+echo "--- Step 4: repoint gated_{split}_records.csv at this cluster's fresh paths ---"
+python src/gating_mechanism/repath_gated_csvs.py \
+    --new-metadata data/medsam-predictions/metadata.jsonl \
+    --csv-dir src/gating_mechanism
+
+echo "========================================"
+echo "end : $(date)"
+echo "========================================"

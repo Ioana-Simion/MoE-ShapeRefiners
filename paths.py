@@ -10,9 +10,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-PROJECT_ROOT        = Path.home() / "projects" / "MoE-ShapeRefine-MedicalSeg"
-MEDSAM_ROOT          = Path.home() / "projects" / "MedSAM"
-TOPLEVEL_DATA_ROOT   = Path.home() / "projects" / "data"
+PROJECT_ROOT        = Path(os.environ.get(
+    "MOE_PROJECT_ROOT", str(Path.home() / "projects" / "MoE-ShapeRefine-MedicalSeg")
+))
+MEDSAM_ROOT          = Path(os.environ.get(
+    "MOE_MEDSAM_ROOT", str(Path.home() / "projects" / "MedSAM")
+))
+TOPLEVEL_DATA_ROOT   = Path(os.environ.get(
+    "MOE_DATA_ROOT", str(Path.home() / "projects" / "data")
+))
 
 SCRATCH_DATA_ROOT    = Path(os.environ.get("SCRATCH_DATA_ROOT", f"/scratch-shared/{os.environ.get('USER', '')}"))
 SCRATCH_DATA         = SCRATCH_DATA_ROOT / "data"
