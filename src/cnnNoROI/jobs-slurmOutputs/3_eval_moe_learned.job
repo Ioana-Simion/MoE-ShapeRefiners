@@ -104,6 +104,22 @@ python evaluation/gate_analysis.py \
     --eval-csv     "${OUT_ROOT}/evaluation_hard.csv" \
     --output-dir   "${OUT_ROOT}/gate_analysis"
 
+echo ""
+echo "--- Step 5: visualize a handful of hard + soft predictions (PLAN_C_EVAL §6) ---"
+python evaluation/visualize_moe_learned.py \
+    --eval-csv        "${OUT_ROOT}/evaluation_hard.csv" \
+    --pred-mask-root  "${OUT_ROOT}/hard/binary_masks" \
+    --gate-weights    "${OUT_ROOT}/gate_weights_test.csv" \
+    --method-label    "Learned MoE (hard)" \
+    --output-dir      "${OUT_ROOT}/visualizations_hard"
+
+python evaluation/visualize_moe_learned.py \
+    --eval-csv        "${OUT_ROOT}/evaluation_soft.csv" \
+    --pred-mask-root  "${OUT_ROOT}/soft/binary_masks" \
+    --gate-weights    "${OUT_ROOT}/gate_weights_test.csv" \
+    --method-label    "Learned MoE (soft)" \
+    --output-dir      "${OUT_ROOT}/visualizations_soft"
+
 echo "========================================"
 echo "end : $(date)"
 echo "========================================"
