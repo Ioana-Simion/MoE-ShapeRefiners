@@ -40,7 +40,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from gating_mechanism.gating_mechanism import (   # noqa: E402
-    DEFAULT_FEATURES_CSV, LEARNED_FEATURE_COLS, LEARNED_JOIN_KEYS,
+    DEFAULT_FEATURES_CSV, DEFAULT_THRESHOLD, LEARNED_FEATURE_COLS, LEARNED_JOIN_KEYS,
+    route_to_expert,
 )
 
 SHAPE_COLS = [c for c in LEARNED_FEATURE_COLS if c != "area"]  # area handled separately (size, not shape)
@@ -112,9 +113,19 @@ def main() -> None:
             "mean_area_by_expert": {str(k): float(v) for k, v in mean_by_group.items()},
         }
 
-    # Does argmax_expert recover the ORIGINAL area-threshold rule's split?
-    if "size_group" in merged.columns:
-        rule_small = (merged["size_group"] == "small").astype(int)
+    # Does argmax_expert recover the ORIGINAL area-threshold ROUTING rule's
+    # split? Deliberately NOT using the eval CSV's "size_group" here -- that's
+    # a bbox-area threshold computed for METRIC REPORTING (evaluate_medsam_
+    # pengwin.py), a different quantity from the foreground-pixel-count
+    # threshold (DEFAULT_THRESHOLD=5402 on medsam_area) that actually decided
+    # expert_small/expert_large routing for the real rule-based cnnNoROI
+    # model (see gating_mechanism.py). medsam_area is already the exact same
+    # column gating_mechanism.py computed that routing decision from, so the
+    # true rule label is re-derived directly here instead of proxying through
+    # a different threshold.
+    if "medsam_area" in merged.columns:
+        rule_label = merged["medsam_area"].apply(route_to_expert)
+        rule_small = (rule_label == "expert_small").astype(int)
         # Whichever expert index is more common among rule-small fragments is
         # the "learned analogue" of expert_small, for a same-direction comparison.
         analogue_small = int(merged.loc[rule_small == 1, "argmax_expert"].mode().iat[0]) \
@@ -123,6 +134,7 @@ def main() -> None:
             learned_small = (merged["argmax_expert"] == analogue_small).astype(int)
             agreement = float((learned_small == rule_small).mean())
             summary["agreement_with_rule_based_split"] = {
+                "routing_threshold_px": DEFAULT_THRESHOLD,
                 "learned_expert_analogous_to_expert_small": analogue_small,
                 "fraction_agreeing_with_area_threshold_rule": agreement,
             }
