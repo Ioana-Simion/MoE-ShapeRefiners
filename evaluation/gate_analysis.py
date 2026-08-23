@@ -133,10 +133,21 @@ def main() -> None:
         if analogue_small is not None:
             learned_small = (merged["argmax_expert"] == analogue_small).astype(int)
             agreement = float((learned_small == rule_small).mean())
+            true_small_frac = float(rule_small.mean())
+            # Trivial baseline: always guess the majority class under the true
+            # rule (here, almost always "large"), never even looking at the
+            # fragment. If raw agreement is BELOW this, the gate's routing
+            # imbalance (see balance_check) is costing more agreement than a
+            # baseline that does no work at all -- essential context, since
+            # raw agreement alone reads as "pretty good" without it.
+            majority_baseline = float(max(true_small_frac, 1.0 - true_small_frac))
             summary["agreement_with_rule_based_split"] = {
                 "routing_threshold_px": DEFAULT_THRESHOLD,
                 "learned_expert_analogous_to_expert_small": analogue_small,
+                "true_fraction_small_under_rule": true_small_frac,
+                "trivial_always_majority_class_baseline": majority_baseline,
                 "fraction_agreeing_with_area_threshold_rule": agreement,
+                "agreement_minus_trivial_baseline": agreement - majority_baseline,
             }
 
     # --- §3.2 Shape correlation --------------------------------------------
